@@ -73,6 +73,15 @@ from rosidl_runtime_py.convert import message_to_ordereddict
 from .mapping import Mapping
 from .ros_topic_namespace import resolve_ros_namespace, resolve_ros_topic as _resolve_ros_topic
 from .plugins.ros_camera import ROSCameraStreamer
+from .plugins.camera_device_manager import (
+    CameraDeviceManager,
+    FormatValidationError,
+    decide_recovery,
+    RECOVERY_NONE,
+    RECOVERY_RESTART,
+    RECOVERY_RECONFIGURE,
+    RECOVERY_RERESOLVE,
+)
 from .plugins.navigation_bridge import NavigationBridge
 from .health import HealthPublisher
 from .telemetry import TelemetryProcessor
@@ -528,6 +537,16 @@ class MQTTBridgeNode(Node):
                 "use_paho_direct=True: Forcing paho-mqtt direct connection (bypassing Cyberwave SDK)"
             )
             use_cw = False
+        # Camera runtime overrides (config/params.yaml `camera:` block). These let
+        # an operator pin pixel_format/resolution/fps without editing the per-robot
+        # mapping; they override the mapping's camera defaults at startup. Runtime
+        # adaptation may still LOWER fps/resolution under load. Sentinels ("" / 0)
+        # mean "not overridden — use the mapping value".
+        self.declare_parameter("camera.pixel_format", "")
+        self.declare_parameter("camera.image_width", 0)
+        self.declare_parameter("camera.image_height", 0)
+        self.declare_parameter("camera.fps", 0)
+
         # Note: image_topic is now in the robot mapping file under camera.image_topic
         self.declare_parameter("webrtc.auto_start", False)
         self.declare_parameter("webrtc.auto_start_delay_sec", 10.0)
@@ -623,6 +642,40 @@ class MQTTBridgeNode(Node):
         except Exception as e:
             self.get_logger().warning(f"Could not load mapping: {e}")
 
+        # params.yaml camera overrides merged onto the mapping (one place so the
+        # manager, streamer, and track agree).
+        self._apply_camera_param_overrides()
+
+        # managed_by_bridge: bridge owns the usb_cam process (runtime format
+        # changes, no respawn EBUSY race); else the static launch node is used.
+        self._camera_manager = None
+        try:
+            camera_cfg = self._mapping.raw.get("camera", {}) if self._mapping else {}
+            if camera_cfg.get("managed_by_bridge"):
+                # Launch usb_cam under the SAME namespace the bridge subscribes in,
+                # so /<ns>/image_raw matches (else the track receives 0 frames).
+                self._camera_manager = CameraDeviceManager(
+                    camera_cfg,
+                    log=self.get_logger(),
+                    namespace=self._resolve_ros_namespace(),
+                )
+                pf = camera_cfg.get("pixel_format", "mjpeg2rgb")
+                w = int(camera_cfg.get("image_width", 1920))
+                h = int(camera_cfg.get("image_height", 1080))
+                fps = int(camera_cfg.get("capture_fps", camera_cfg.get("fps", 30)))
+                try:
+                    self._camera_manager.start(pf, w, h, fps)
+                    self.get_logger().info(
+                        f"CameraDeviceManager started usb_cam: {pf} {w}x{h}@{fps} "
+                        f"on {self._camera_manager.video_device}"
+                    )
+                except FormatValidationError as exc:
+                    self.get_logger().error(f"Initial camera format invalid: {exc}")
+                except Exception as exc:
+                    self.get_logger().error(f"Failed to start managed camera: {exc}")
+        except Exception as exc:
+            self.get_logger().warning(f"Camera manager init skipped: {exc}")
+
         # Initialize camera streamer proactively to pre-cache frames
         self._ros_streamer = None
         self._webrtc_start_future = None  # Track ongoing WebRTC start operation
@@ -652,6 +705,25 @@ class MQTTBridgeNode(Node):
                     self.get_logger().info(
                         "WebRTC force_turn ENABLED - all media will be relayed through TURN server"
                     )
+                    # Relay-only ICE needs outbound reach to TURN; a blocked path
+                    # is the usual silent no-media failure in Docker, so surface it.
+                    try:
+                        from .plugins.webrtc_preflight import preflight_turn
+
+                        pf = preflight_turn(ice_servers, timeout=3.0)
+                        if pf.get("reachable"):
+                            self.get_logger().info(
+                                f"TURN/STUN preflight OK via {pf.get('url')} "
+                                f"(mapped={pf.get('mapped')})"
+                            )
+                        else:
+                            self.get_logger().error(
+                                f"TURN/STUN preflight FAILED ({pf.get('error')}). "
+                                "Relay-only WebRTC may not connect — check container "
+                                "outbound UDP to the TURN server."
+                            )
+                    except Exception as exc:
+                        self.get_logger().debug(f"TURN preflight skipped: {exc}")
 
                 # Use SDK's native mqtt client for the streamer if available.
                 # The BaseVideoStreamer from the SDK expects the SDK's mqtt object
@@ -1148,16 +1220,30 @@ class MQTTBridgeNode(Node):
         )
 
     def _resolve_ros_namespace(self) -> str:
-        """Resolve ROS namespace override, defaulting to twin_uuid."""
+        """Resolve the per-robot ROS namespace.
+
+        Honors an explicit ``ros_namespace`` param (set by
+        master_beast.launch.py); otherwise derives ``ugv_beast_<first6 of twin
+        uuid>`` so multiple UGV Beasts can share a ROS 2 graph without colliding.
+
+        The fallback derives from the ``CYBERWAVE_TWIN_UUID`` environment
+        variable — the SAME source master_beast.launch.py uses for the hardware
+        nodes — so the bridge and hardware always land on identical topics even
+        if the launch did not pass ``ros_namespace`` explicitly. Empty → global.
+        """
         try:
             configured = str(self.get_parameter("ros_namespace").value or "")
         except Exception:
             configured = ""
-        mapping = getattr(self, "_mapping", None)
-        twin_uuid = getattr(mapping, "twin_uuid", None) if mapping is not None else None
+        # Mirror master_beast.launch.py precedence exactly so the bridge and the
+        # hardware nodes always agree, whether or not the launch passed the param:
+        #   explicit ros_namespace param > CYBERWAVE_ROS_NAMESPACE env >
+        #   derived from CYBERWAVE_TWIN_UUID env.
+        override = os.getenv("CYBERWAVE_ROS_NAMESPACE", "").strip().strip("/")
+        twin_uuid = os.getenv("CYBERWAVE_TWIN_UUID", "")
         return resolve_ros_namespace(
-            configured_namespace=configured,
-            twin_uuid=str(twin_uuid) if twin_uuid else None,
+            configured_namespace=configured or override,
+            twin_uuid=twin_uuid or None,
         )
 
     def resolve_ros_topic(self, topic_name: str) -> str:
@@ -2542,8 +2628,13 @@ class MQTTBridgeNode(Node):
                         "stop_video",
                     ]
 
-                    # Route actuation commands to the 'actuation' handler with full payload
-                    if command in actuation_commands:
+                    # Route actuation commands to the 'actuation' handler with full
+                    # payload. A message carrying an explicit top-level
+                    # ``velocity_command`` is also an actuation (analog velocity),
+                    # even when its discrete ``command`` is not in the static list.
+                    if command in actuation_commands or isinstance(
+                        data.get("velocity_command"), dict
+                    ):
                         # Pass the full original data (including 'command' field) to actuation handler
                         success = self._command_registry.handle_command(
                             "actuation", data
@@ -3428,28 +3519,57 @@ class MQTTBridgeNode(Node):
         self._last_right_pos = None
         self.get_logger().info("Internal odometry has been reset to (0,0,0)")
 
+    def _apply_camera_param_overrides(self) -> None:
+        """Merge params.yaml `camera:` overrides onto the mapping (sentinels ""/0 = skip)."""
+        if not (hasattr(self, "_mapping") and self._mapping):
+            return
+        try:
+            cam = self._mapping.raw.setdefault("camera", {})
+        except Exception:
+            return
+
+        def _p(name):
+            try:
+                return self.get_parameter(name).value
+            except Exception:
+                return None
+
+        changed: Dict[str, Any] = {}
+        pf = _p("camera.pixel_format")
+        if pf:
+            cam["pixel_format"] = pf
+            changed["pixel_format"] = pf
+        w = _p("camera.image_width")
+        if w and int(w) > 0:
+            cam["image_width"] = int(w)
+            changed["image_width"] = int(w)
+        h = _p("camera.image_height")
+        if h and int(h) > 0:
+            cam["image_height"] = int(h)
+            changed["image_height"] = int(h)
+        fps = _p("camera.fps")
+        if fps and int(fps) > 0:
+            cam["capture_fps"] = int(fps)
+            cam["stream_fps"] = min(int(cam.get("stream_fps", fps) or fps), int(fps))
+            changed["fps"] = int(fps)
+        if changed:
+            self.get_logger().info(
+                f"Camera params.yaml overrides applied over mapping: {changed}"
+            )
+
     def start_camera_stream(
-        self, recording: bool = True, fps: Optional[int] = None
+        self,
+        recording: bool = True,
+        fps: Optional[int] = None,
+        pixel_format: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
     ) -> None:
-        """Starts camera stream using SDK's BaseVideoStreamer.start() method.
+        """Start the WebRTC stream via ROSCameraStreamer (SDK BaseVideoStreamer).
 
-        This method uses the Cyberwave SDK 0.3.24's BaseVideoStreamer which handles:
-        - WebRTC offer/answer signaling via MQTT
-        - ICE candidate exchange
-        - TURN/STUN server configuration
-        - Connection state management
-
-        Our ROSCameraStreamer extends SDK's BaseVideoStreamer and adds:
-        - ROS 2 image topic subscription (/image_raw)
-        - Frame format conversion (ROS Image -> VideoFrame)
-        - Frame caching for immediate streaming
-
-        IMPORTANT: This is using SDK functionality, not bypassing it. The SDK's
-        BaseVideoStreamer.start() method is the correct way to initiate WebRTC
-        when you have a custom streamer that extends BaseVideoStreamer.
-
-        COMPLIANCE NOTE (2026-01-18):
-        The Edge Device (this node) acts as the WebRTC Offerer.
+        Edge is the WebRTC offerer. If pixel_format/width/height are given and
+        differ from the current managed-camera format, the camera is reconfigured
+        (managed relaunch) first.
         """
         import inspect
 
@@ -3460,6 +3580,22 @@ class MQTTBridgeNode(Node):
                 caller = stack[1].function
         except Exception:
             pass
+
+        # Requested a specific format and we own the camera -> switch first
+        # (set_camera_format restarts the stream), then return.
+        if (
+            self._camera_manager is not None
+            and (pixel_format or width or height)
+        ):
+            result = self.set_camera_format(
+                pixel_format=pixel_format, width=width, height=height, fps=fps,
+                recording=recording,
+            )
+            if isinstance(result, dict) and result.get("status") == "error":
+                self.get_logger().error(
+                    f"start_camera_stream: requested format rejected: {result.get('message')}"
+                )
+            return
 
         # When run_with_auto_reconnect() is active, the SDK handles start_video commands
         # internally. We should NOT also call start() ourselves as it causes duplicate
@@ -3624,6 +3760,71 @@ class MQTTBridgeNode(Node):
             except Exception as e:
                 self.get_logger().error(f"Error stopping camera stream: {e}")
 
+    def set_camera_format(
+        self,
+        pixel_format: Optional[str] = None,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+        fps: Optional[int] = None,
+        recording: bool = True,
+    ) -> Dict[str, Any]:
+        """Switch capture format at runtime: validate -> stop stream -> reconfigure
+        usb_cam -> restart. Returns {"status": "ok"|"error", "applied": {...}}.
+        """
+        mgr = self._camera_manager
+        if mgr is None:
+            return {"status": "error", "message": "camera not managed by bridge"}
+
+        # Fill unspecified fields from the current/default config.
+        cam_cfg = self._mapping.raw.get("camera", {}) if self._mapping else {}
+        cur = mgr.current or (
+            cam_cfg.get("pixel_format", "mjpeg2rgb"),
+            int(cam_cfg.get("image_width", 1920)),
+            int(cam_cfg.get("image_height", 1080)),
+            int(cam_cfg.get("capture_fps", 30)),
+        )
+        pf = pixel_format or cur[0]
+        w = int(width or cur[1])
+        h = int(height or cur[2])
+        cap_fps = int(fps or cur[3])
+
+        try:
+            mgr.validate(pf, w, h, cap_fps)
+        except FormatValidationError as exc:
+            return {"status": "error", "message": str(exc)}
+
+        was_streaming = (
+            getattr(self, "_ros_streamer", None) is not None
+            and getattr(self._ros_streamer, "pc", None) is not None
+        )
+        self.get_logger().info(
+            f"set_camera_format -> {pf} {w}x{h}@{cap_fps} (was_streaming={was_streaming})"
+        )
+
+        # Stop stream (frees the track + /image_raw subscription) before reconfig.
+        if was_streaming:
+            try:
+                fut = asyncio.run_coroutine_threadsafe(
+                    self._ros_streamer.stop(), self._async_loop
+                )
+                fut.result(timeout=10.0)
+            except Exception as exc:
+                self.get_logger().warning(f"Error stopping stream before reformat: {exc}")
+
+        try:
+            mgr.reconfigure(pf, w, h, cap_fps)   # kill -> reap -> device-free -> relaunch
+        except FormatValidationError as exc:
+            return {"status": "error", "message": str(exc)}
+        except Exception as exc:
+            self.get_logger().error(f"Camera reconfigure failed: {exc}")
+            return {"status": "error", "message": f"reconfigure failed: {exc}"}
+
+        # Streamer rebuilds a fresh track on next start() -> just restart if it was up.
+        applied = {"pixel_format": pf, "width": w, "height": h, "fps": cap_fps}
+        if was_streaming:
+            self.start_camera_stream(recording=recording, fps=fps)
+        return {"status": "ok", "applied": applied}
+
     async def _set_stop_event(self) -> None:
         """Helper to set the stop event from the async loop."""
         if hasattr(self, "_webrtc_stop_event"):
@@ -3637,76 +3838,105 @@ class MQTTBridgeNode(Node):
         """Periodic check of the camera availability and settings."""
         now = time.time()
 
-        # 1. Check if the video device exists
-        video_device = "/dev/video0"
-        if hasattr(self, "_mapping") and self._mapping:
-            video_device = self._mapping.raw.get("camera", {}).get(
-                "video_device", video_device
-            )
+        # 1. Resolve the device path. For the bridge-managed camera, use the
+        # manager's resolved path (the mapping value may be "auto").
+        managed = self._camera_manager is not None
+        if managed:
+            video_device = self._camera_manager.video_device
+        else:
+            video_device = "/dev/video0"
+            if hasattr(self, "_mapping") and self._mapping:
+                video_device = self._mapping.raw.get("camera", {}).get(
+                    "video_device", video_device
+                )
 
         device_exists = os.path.exists(video_device)
 
-        # 2. Check if we are receiving images
-        is_receiving = (
-            now - self._last_image_time
-        ) < 5.0  # Receiving if last image was < 5s ago
+        # 2. Are we receiving images?
+        is_receiving = (now - self._last_image_time) < 5.0
+        silent_secs = now - self._last_image_time
 
-        # 3. Check if usb_cam node is in the graph
+        # 3. Is the usb_cam node in the graph? (managed: also trust the process)
         node_names = self.get_node_names()
         usb_cam_running = any("usb_cam" in name for name in node_names)
+        if managed:
+            usb_cam_running = usb_cam_running or self._camera_manager.is_running()
 
-        # 4. Log status and handle recovery
-        if not device_exists:
-            self.get_logger().error(
-                f"CAMERA WATCHDOG: Device {video_device} NOT FOUND! Check connection."
-            )
-        elif not usb_cam_running:
-            self.get_logger().error(
-                f"CAMERA WATCHDOG: usb_cam node is NOT RUNNING! Attempting to restart via WebRTC trigger..."
-            )
-        elif not is_receiving:
-            # Check if we have a streamer and it's actually subscribed
-            streamer_active = False
-            if (
-                hasattr(self, "_ros_streamer")
-                and self._ros_streamer
-                and self._ros_streamer.streamer
-            ):
-                streamer_active = True
+        streaming = (
+            getattr(self, "_ros_streamer", None) is not None
+            and getattr(self._ros_streamer, "streamer", None) is not None
+            and getattr(self._ros_streamer, "pc", None) is not None
+        )
 
-            if streamer_active:
-                self.get_logger().warn(
-                    f"CAMERA WATCHDOG: Device {video_device} exists but NO IMAGES on /image_raw! Is the camera busy?"
-                )
-                if (
-                    now - self._last_image_time > 10.0
-                ):  # 10 seconds of silence while streaming
-                    self.get_logger().error(
-                        "CAMERA WATCHDOG: Streamer is active but no data for 10s. Forcing reconnection."
-                    )
-            else:
-                # If no streamer is active, we don't expect _last_image_time to be updated by the track.
-                # However, we have a watchdog subscription in __init__ that should update it.
-                self.get_logger().debug(
-                    "CAMERA WATCHDOG: No active streamer, checking watchdog subscription..."
-                )
-        else:
-            # Everything seems fine, log periodically (every 60s instead of 30s to avoid spam)
-            if now - self._last_camera_check_time > 60.0:
+        # 4. Decide + execute recovery (managed camera only); else just log.
+        action = decide_recovery(
+            managed=managed,
+            device_exists=device_exists,
+            usb_cam_running=usb_cam_running,
+            receiving=is_receiving,
+            streaming=streaming,
+            silent_secs=silent_secs,
+        )
+
+        if action != RECOVERY_NONE:
+            self._recover_camera(action, video_device)
+            return
+
+        if not is_receiving and not managed:
+            self.get_logger().warn(
+                f"CAMERA WATCHDOG: {video_device} exists but NO IMAGES on /image_raw (unmanaged)"
+            )
+        elif is_receiving and now - self._last_camera_check_time > 60.0:
+            self.get_logger().info(
+                f"CAMERA WATCHDOG: Camera OK ({video_device} active, streaming at /image_raw)"
+            )
+            track = (
+                getattr(self._ros_streamer, "streamer", None)
+                if getattr(self, "_ros_streamer", None)
+                else None
+            )
+            if track is not None:
+                tf, ts = track.get_quality() if hasattr(track, "get_quality") else (track.fps, 1.0)
                 self.get_logger().info(
-                    f"CAMERA WATCHDOG: Camera OK ({video_device} active, streaming at /image_raw)"
+                    f"CAMERA STATS: {track.actual_width}x{track.actual_height} "
+                    f"send_fps={tf} scale={ts} encoding={track.encoding}"
                 )
-                # Also log current image stats if available
-                if (
-                    hasattr(self, "_ros_streamer")
-                    and self._ros_streamer
-                    and self._ros_streamer.streamer
-                ):
-                    track = self._ros_streamer.streamer
-                    self.get_logger().info(
-                        f"CAMERA STATS: {track.actual_width}x{track.actual_height} @ {track.fps}fps, encoding={track.encoding}"
-                    )
-                self._last_camera_check_time = now
+            self._last_camera_check_time = now
+
+    def _default_camera_format(self):
+        cam = self._mapping.raw.get("camera", {}) if self._mapping else {}
+        return (
+            cam.get("pixel_format", "mjpeg2rgb"),
+            int(cam.get("image_width", 1920)),
+            int(cam.get("image_height", 1080)),
+            int(cam.get("capture_fps", cam.get("fps", 30))),
+        )
+
+    def _recover_camera(self, action: str, device: str) -> None:
+        """Execute a watchdog recovery action against the managed camera."""
+        mgr = self._camera_manager
+        if mgr is None:
+            return
+        try:
+            if action == RECOVERY_RERESOLVE:
+                newdev = mgr.reresolve_device()
+                self.get_logger().error(
+                    f"CAMERA WATCHDOG: device {device} missing; re-resolved to {newdev}"
+                )
+                if os.path.exists(newdev):
+                    mgr.start(*(mgr.current or self._default_camera_format()))
+            elif action == RECOVERY_RESTART:
+                self.get_logger().error(
+                    "CAMERA WATCHDOG: usb_cam not running; restarting managed camera"
+                )
+                mgr.start(*(mgr.current or self._default_camera_format()))
+            elif action == RECOVERY_RECONFIGURE:
+                self.get_logger().error(
+                    "CAMERA WATCHDOG: no frames for >10s; reconfiguring camera (clean device cycle)"
+                )
+                mgr.reconfigure(*(mgr.current or self._default_camera_format()))
+        except Exception as exc:
+            self.get_logger().error(f"CAMERA WATCHDOG recovery ({action}) failed: {exc}")
 
     def destroy_node(self) -> None:
         try:

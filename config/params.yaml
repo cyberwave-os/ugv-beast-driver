@@ -31,10 +31,29 @@
       fps: 15.0
       force_turn: true # Force all WebRTC traffic through TURN relay (bypasses NAT/firewall)
 
-    # usb_cam overrides merged in master_beast.launch.py (teleop: /image_raw only, no image_proc)
+    # Camera runtime defaults (operator override layer).
+    # These OVERRIDE the per-robot mapping's camera block at startup, so you can
+    # pin pixel_format / resolution / fps here without editing the mapping. The
+    # dynamic adaptation controller may still LOWER fps first, then resolution, at
+    # runtime under CPU load (never below adaptation.fps_floor = 15 fps). The
+    # capability ceiling, supported_formats, video_device auto-discovery, and the
+    # adaptation ladder stay defined in config/mappings/robot_ugv_beast_v1.yaml
+    # (the per-robot source of truth for camera capabilities).
+    #
+    # Default chosen by benchmarking THIS hardware (scripts/ugv_beast/benchmark_camera.py).
+    # The Pi 5 has NO hardware H.264 encoder, so WebRTC video is encoded in software.
+    # Measured sustained H264 encode capacity on a Pi 5: 1280x720 ~70 fps, 1920x1080
+    # ~33 fps. 1280x720@30 leaves comfortable headroom for the ROS nav/control stack,
+    # while 1080p can't hold 30 fps software and would starve it. MJPG keeps USB-2
+    # bandwidth low so the camera can deliver the resolution in the first place.
+    # Raise to 1920x1080 (adaptation ceiling) or drop to 640x480 to free CPU; leave
+    # pixel_format "" (and sizes 0) to defer entirely to the mapping defaults.
+    # Re-run benchmark_camera.py on other robots to pick their own default.
     camera:
-      pixel_format: "yuyv"
-      io_method: "mmap"
+      pixel_format: "mjpeg2rgb"
+      image_width: 1280
+      image_height: 720
+      fps: 30
 
     # Global kill-switch for all upstream MQTT traffic (ROS -> MQTT)
     # If true, no telemetry, status, or health messages will be sent to the cloud.

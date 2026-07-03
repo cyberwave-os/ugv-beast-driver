@@ -956,6 +956,14 @@ ros2 topic info /ugv/joint_states --verbose
 ros2 topic echo /voltage
 ```
 
+> **MQTT auth for the examples below:** the broker username is the public
+> default `mqttcyb`; the password is **your Cyberwave API key**. Never hardcode
+> it — export it once and the `-P "$CYBERWAVE_API_KEY"` examples will pick it up:
+>
+> ```bash
+> export CYBERWAVE_API_KEY="cw_…"   # your token; do not commit
+> ```
+
 ## **3. Test Headlights (LED Control)**
 
 ```bash
@@ -969,42 +977,47 @@ sudo apt update
 sudo apt install -y mosquitto-clients
 
 # Turn all lights ON (Terminal 2)
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
-  -m '{"command":"led_ctrl","data":{"all":255}}'
+  -m '{"command":"lights","data":{"all":255}}'
 
 # Wait 3 seconds, then turn OFF
 sleep 3
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
-  -m '{"command":"led_ctrl","data":{"all":0}}'
+  -m '{"command":"lights","data":{"all":0}}'
 
 # Test chassis light only
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
-  -m '{"command":"led_ctrl","data":{"chassis_light":255,"camera_light":0}}'
+  -m '{"command":"lights","data":{"chassis_light":255,"camera_light":0}}'
 ```
 
 ## **4. Test Velocity Control**
+
+Movement uses the `velocity_command` payload (the legacy `cmd_vel` command is
+removed). `linear_x`/`angular_z` are clamped to `CYBERWAVE_UGV_MAX_LINEAR_SPEED`
+/ `CYBERWAVE_UGV_MAX_ANGULAR_SPEED` (defaults 0.8 m/s / 1.0 rad/s). `duration_ms`
+arms a deadman stop, so resend while driving.
 
 ```bash
 # Monitor velocity commands (Terminal 3)
 ros2 topic echo /cmd_vel
 
 # Send forward motion (Terminal 2)
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
-  -m '{"command":"cmd_vel","data":{"linear":{"x":0.3,"y":0,"z":0},"angular":{"x":0,"y":0,"z":0}}}'
+  -m '{"command":"velocity_command","source_type":"tele","velocity_command":{"linear_x":0.3,"angular_z":0,"duration_ms":600}}'
 
 # Stop
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
-  -m '{"command":"cmd_vel","data":{"linear":{"x":0,"y":0,"z":0},"angular":{"x":0,"y":0,"z":0}}}'
+  -m '{"command":"stop","source_type":"tele"}'
 
 # Turn in place
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
-  -m '{"command":"cmd_vel","data":{"linear":{"x":0,"y":0,"z":0},"angular":{"x":0,"y":0,"z":0.5}}}'
+  -m '{"command":"velocity_command","source_type":"tele","velocity_command":{"linear_x":0,"angular_z":0.5,"duration_ms":600}}'
 ```
 
 ## **5. Test Pan-Tilt Camera**
@@ -1014,12 +1027,12 @@ mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
 ros2 topic echo /ugv/joint_states
 
 # Move camera (Terminal 2)
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
   -m '{"command":"pan_tilt","data":{"pan":0.5,"tilt":0.3}}'
 
 # Center camera
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
   -m '{"command":"pan_tilt","data":{"pan":0,"tilt":0}}'
 ```
@@ -1031,12 +1044,12 @@ mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
 ros2 topic echo /emergency_stop
 
 # Activate E-stop (Terminal 2)
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
   -m '{"command":"estop","data":{"activate":true}}'
 
 # Deactivate E-stop
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 \
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" \
   -t "cyberwave/twin/$TWIN_UUID/command" \
   -m '{"command":"estop","data":{"activate":false}}'
 ```
@@ -1064,22 +1077,22 @@ export TWIN_UUID="00000000-0000-0000-0000-000000000000"
 
 # Test 1: Lights ON
 echo "Testing: Lights ON"
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "cyberwave/twin/$TWIN_UUID/command" -m '{"command":"led_ctrl","data":{"all":255}}'
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "cyberwave/twin/$TWIN_UUID/command" -m '{"command":"lights","data":{"all":255}}'
 sleep 2
 
 # Test 2: Lights OFF
 echo "Testing: Lights OFF"
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "cyberwave/twin/$TWIN_UUID/command" -m '{"command":"led_ctrl","data":{"all":0}}'
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "cyberwave/twin/$TWIN_UUID/command" -m '{"command":"lights","data":{"all":0}}'
 sleep 2
 
 # Test 3: Move forward slowly
 echo "Testing: Move forward"
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "cyberwave/twin/$TWIN_UUID/command" -m '{"command":"cmd_vel","data":{"linear":{"x":0.2,"y":0,"z":0},"angular":{"x":0,"y":0,"z":0}}}'
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "cyberwave/twin/$TWIN_UUID/command" -m '{"command":"velocity_command","source_type":"tele","velocity_command":{"linear_x":0.2,"angular_z":0,"duration_ms":2500}}'
 sleep 2
 
 # Test 4: Stop
 echo "Testing: Stop"
-mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "cyberwave/twin/$TWIN_UUID/command" -m '{"command":"cmd_vel","data":{"linear":{"x":0,"y":0,"z":0},"angular":{"x":0,"y":0,"z":0}}}'
+mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "cyberwave/twin/$TWIN_UUID/command" -m '{"command":"stop","source_type":"tele"}'
 
 echo "Tests complete!"
 ```
@@ -1099,7 +1112,7 @@ ros2 topic echo /ugv/joint_states
 ## Control from MQTT
 
 ```bash
- mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "localcyberwave/joint/60d542ec-7d65-48b7-83dc-ecd89adbacec/update" -m '{
+ mosquitto_pub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "localcyberwave/joint/60d542ec-7d65-48b7-83dc-ecd89adbacec/update" -m '{
   "source_type": "tele",
   "joint_names": ["left_up_wheel_link_joint"],
   "points": [
@@ -1116,7 +1129,7 @@ ros2 topic echo /ugv/joint_states
 ```
 
 ```bash
- mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -mqttcyb231 -t "localcyberwave/joint/60d542ec-7d65-48b7-83dc-ecd89adbacec/update" -v
+ mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "localcyberwave/joint/60d542ec-7d65-48b7-83dc-ecd89adbacec/update" -v
 ```
 
 ## chech the messages
@@ -1130,7 +1143,7 @@ These commands assume your environment prefix is `local` (as seen in your logs).
 This will show the `cmd_vel` and `led_ctrl` messages sent from your keyboard:
 
 ```bash
-mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "localcyberwave/twin/ace84397-be7d-4f4d-9f66-74217b2f3509/command" -v
+mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "localcyberwave/twin/ace84397-be7d-4f4d-9f66-74217b2f3509/command" -v
 ```
 
 ### 2. Retrieve Upstream Odometry (The physical robot's position)
@@ -1138,7 +1151,7 @@ mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "localcy
 This will show the `position` and `rotation` updates sent from the physical robot to update the digital twin:
 
 ```bash
-mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "localcyberwave/twin/ace84397-be7d-4f4d-9f66-74217b2f3509/status/odom" -v
+mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "localcyberwave/twin/ace84397-be7d-4f4d-9f66-74217b2f3509/status/odom" -v
 ```
 
 ### 3. Retrieve Upstream Joint States (Wheel and Pan-Tilt rotation)
@@ -1146,7 +1159,7 @@ mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "localcy
 This shows the status of individual joints (e.g., wheel rotation):
 
 ```bash
-mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "localcyberwave/joint/ace84397-be7d-4f4d-9f66-74217b2f3509/update" -v
+mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "localcyberwave/joint/ace84397-be7d-4f4d-9f66-74217b2f3509/update" -v
 ```
 
 ### 4. Spy on ALL traffic for this Twin (Recommended)
@@ -1154,7 +1167,7 @@ mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "localcy
 This wildcard command will catch **every** message associated with this twin across both `twin` and `joint` scopes:
 
 ```bash
-mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P mqttcyb231 -t "localcyberwave/+/ace84397-be7d-4f4d-9f66-74217b2f3509/#" -v
+mosquitto_sub -h mqtt.cyberwave.com -p 1883 -u mqttcyb -P "$CYBERWAVE_API_KEY" -t "localcyberwave/+/ace84397-be7d-4f4d-9f66-74217b2f3509/#" -v
 ```
 
 ### Summary Table for UUID `ace84...509`:

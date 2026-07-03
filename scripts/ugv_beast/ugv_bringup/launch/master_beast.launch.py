@@ -26,7 +26,36 @@ def generate_launch_description():
         os.getcwd()
     except (FileNotFoundError, OSError):
         os.chdir(home_dir)
-    
+
+    # --- Per-robot ROS 2 namespace ------------------------------------------
+    # Derive a fleet-safe namespace from the twin UUID so multiple UGV Beasts can
+    # run on one ROS 2 graph without topic/node collisions:
+    #     ugv_beast_<first 6 hex chars of the twin uuid>     e.g. ugv_beast_27dca7
+    # The 'ugv_beast_' prefix guarantees a ROS-valid leading letter (a raw UUID
+    # is invalid: it contains '-' and may start with a digit). Empty when
+    # CYBERWAVE_TWIN_UUID is unset -> global topics (single-robot / dev).
+    #
+    # This MUST match mqtt_bridge.ros_topic_namespace.derive_robot_namespace so
+    # the hardware nodes here and the mqtt_bridge land on identical topics. The
+    # namespace is also passed to mqtt_bridge via the 'ros_namespace' param below.
+    #
+    # Override with CYBERWAVE_ROS_NAMESPACE (must be a valid ROS 2 name) to force
+    # a specific namespace; otherwise it is derived from CYBERWAVE_TWIN_UUID.
+    robot_namespace = os.getenv('CYBERWAVE_ROS_NAMESPACE', '').strip().strip('/')
+    if not robot_namespace:
+        _twin_uuid = os.getenv('CYBERWAVE_TWIN_UUID', '').replace('-', '').strip().lower()
+        robot_namespace = f"ugv_beast_{_twin_uuid[:6]}" if _twin_uuid else ''
+
+    def ns_child(child):
+        """Nest a sub-namespace under the robot namespace (no-op if none).
+
+        Used for nodes that already carry a sub-namespace (e.g. robot_state_publisher
+        under 'ugv') so it becomes '<robot_namespace>/ugv'. Other hardware nodes use
+        relative topic names and are placed directly under robot_namespace, so they
+        need no per-topic prefixing here.
+        """
+        return f"{robot_namespace}/{child}" if robot_namespace else child
+
     # 1. Paths to packages and configurations
     ugv_bringup_dir = get_package_share_directory('ugv_bringup')
     ugv_vision_dir = get_package_share_directory('ugv_vision')
@@ -63,8 +92,10 @@ def generate_launch_description():
     )
     
     camera_namespace_arg = DeclareLaunchArgument(
-        name='camera_namespace', default_value='',
-        description='Namespace for camera components'
+        name='camera_namespace', default_value=robot_namespace,
+        description='Namespace for camera components (defaults to the per-robot '
+                    'namespace so usb_cam publishes /<ns>/image_raw, matching the '
+                    'namespaced subscription in mqtt_bridge)'
     )
     
     camera_container_arg = DeclareLaunchArgument(
@@ -82,6 +113,16 @@ def generate_launch_description():
         'use_camera',
         default_value='true' if has_usb_cam else 'false',
         description='Whether to start the USB camera node (requires usb_cam package)'
+    )
+
+    # When true (default), mqtt_bridge owns the usb_cam process (CameraDeviceManager)
+    # so pixel_format/resolution/fps can change at runtime and the respawn EBUSY race
+    # is avoided. The launch-file usb_cam node below is then NOT started. Set false to
+    # fall back to the static launch-file node.
+    camera_managed_by_bridge_arg = DeclareLaunchArgument(
+        'camera_managed_by_bridge',
+        default_value='true',
+        description='Let mqtt_bridge own the usb_cam lifecycle (no static usb_cam node)'
     )
 
     use_image_proc_arg = DeclareLaunchArgument(
@@ -107,20 +148,18 @@ def generate_launch_description():
 
     # 3. Core Hardware Node (Integrated Driver)
     # Handles Serial communication for both Telemetry and Commands
+    # The node uses relative topic names (cmd_vel, ugv/led_ctrl, ...); placing it
+    # under robot_namespace shifts ALL of them (including ones not remapped, e.g.
+    # ugv/oled_ctrl) to /<ns>/... so they match the bridge's namespaced topics.
+    # The old absolute remaps only forced topics back to global and are dropped;
+    # with robot_namespace='' the relative names resolve to /cmd_vel etc. exactly
+    # as before.
     bringup_node = Node(
         package='ugv_bringup',
         executable='ugv_integrated_driver',
         name='ugv_bringup',
+        namespace=robot_namespace or None,
         output='screen',
-        remappings=[
-            ('cmd_vel', '/cmd_vel'),
-            ('ugv/pt_ctrl', '/ugv/pt_ctrl'),
-            ('ugv/led_ctrl', '/ugv/led_ctrl'),
-            ('voltage', '/voltage'),
-            ('imu/data_raw', '/imu/data_raw'),
-            ('imu/mag', '/imu/mag'),
-            ('odom/odom_raw', '/odom/odom_raw'),
-        ]
     )
 
     # 4. Lidar Driver
@@ -143,14 +182,14 @@ def generate_launch_description():
     robot_state_publisher_node = Node(
         package='robot_state_publisher',
         executable='robot_state_publisher',
-        namespace='ugv',
+        namespace=ns_child('ugv'),
         parameters=[{'robot_description': robot_description_content}]
     )
 
     joint_state_publisher_node = Node(
         package='joint_state_publisher',
         executable='joint_state_publisher',
-        namespace='ugv',
+        namespace=ns_child('ugv'),
         name='joint_state_publisher',
         condition=IfCondition(LaunchConfiguration('use_joint_state_publisher')),
         parameters=[{
@@ -165,13 +204,9 @@ def generate_launch_description():
         package='ugv_base_node',
         executable='base_node',
         name='base_node',
+        namespace=robot_namespace or None,
         condition=IfCondition(LaunchConfiguration('use_base_node')),
         parameters=[{'pub_odom_tf': LaunchConfiguration('pub_odom_tf')}],
-        remappings=[
-            ('imu/data', '/imu/data'),
-            ('odom/odom_raw', '/odom/odom_raw'),
-            ('odom', '/odom')
-        ]
     )
 
     base_node_warning = LogInfo(
@@ -181,15 +216,22 @@ def generate_launch_description():
     )
 
     # 7. Cloud Connectivity (MQTT Bridge)
+    # The bridge prefixes its ROS topics with 'ros_namespace' (via
+    # resolve_ros_topic). Pass the same per-robot namespace used for the hardware
+    # nodes so both sides resolve to identical /<ns>/... topics. The bridge node
+    # itself is NOT placed under a launch namespace: it emits absolute /<ns>/...
+    # names directly, so a launch namespace would have no effect (and risk
+    # double-prefixing).
     mqtt_bridge_node = Node(
         package='mqtt_bridge',
         executable='mqtt_bridge_node',
         name='mqtt_bridge_node',
         parameters=[
-            mqtt_config_path, 
+            mqtt_config_path,
             {
                 'robot_id': LaunchConfiguration('robot_id'),
-                'debug_logs': LaunchConfiguration('debug_logs')
+                'debug_logs': LaunchConfiguration('debug_logs'),
+                'ros_namespace': robot_namespace,
             }
         ],
         output='screen'
@@ -211,11 +253,19 @@ def generate_launch_description():
     except Exception:
         camera_overrides = {}
 
+    # Static usb_cam node — only started when the bridge does NOT manage the
+    # camera (camera_managed_by_bridge:=false). When the bridge owns it, the
+    # CameraDeviceManager spawns usb_cam itself (no respawn race, runtime format
+    # changes), so this node must stay out of the graph to avoid two owners of
+    # /dev/video0.
     camera_node = Node(
         package='usb_cam',
         executable='usb_cam_node_exe',
         name='usb_cam',
-        condition=IfCondition(LaunchConfiguration('use_camera')),
+        condition=IfCondition(PythonExpression([
+            "'", LaunchConfiguration('use_camera'), "' == 'true' and '",
+            LaunchConfiguration('camera_managed_by_bridge'), "' == 'false'"
+        ])),
         parameters=[camera_param_file, camera_overrides],
         namespace=LaunchConfiguration('camera_namespace'),
         output='screen',
@@ -275,6 +325,7 @@ def generate_launch_description():
         camera_container_arg,
         debug_logs_arg,
         use_camera_arg,
+        camera_managed_by_bridge_arg,
         use_image_proc_arg,
         use_joint_state_pub_arg,
         use_base_node_arg,

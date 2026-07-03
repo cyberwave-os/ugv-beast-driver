@@ -37,8 +37,13 @@
 # - Do not pass UGV_DRIVER_BASE_IMAGE=cyberwaveos/ugv-driver:base-local to buildx: container
 #   builders cannot see --load'd host images and try Docker Hub instead.
 # - The first colcon pass builds only ldlidar + ugv_interface (the heavy upstream
-#   nav/SLAM/vizanti stack is commented out in the Dockerfile). The ugv_* second
-#   pass is the long part on a Pi — watch package names scroll, it is not frozen.
+#   nav/SLAM/vizanti stack is commented out in the Dockerfile). The launch-critical
+#   second pass (ugv_bringup/ugv_description/ugv_vision + ugv_base_node) is the long
+#   part on a Pi — watch package names scroll, it is not frozen. The unused ugv_*
+#   stack (gazebo/nav/slam/...) is no longer built, and its source + the clone's
+#   .git history are pruned in-layer (STAGE 7) while each colcon stage drops its own
+#   build/ scratch — so the slimming actually shrinks the shipped image (~210 MB)
+#   rather than just hiding files behind a later-layer whiteout.
 # - Prefer ./docker-conf/build-local.sh --pull-base on Pi (skip local base + colcon in base).
 # - Use --host-docker (default on linux/arm64) to avoid buildx-in-container overhead.
 # - Avoid CACHEBUST on every build; use --force-rebuild only when you need a clean mqtt layer.
@@ -60,7 +65,7 @@ IMAGE="cyberwaveos/ugv-driver"
 BASE_TAG="${BASE_TAG:-base-local}"
 FINAL_TAG="${FINAL_TAG:-test-local}"
 PLATFORM="${PLATFORM:-linux/arm64}"
-SDK_VERSION="${CYBERWAVE_SDK_VERSION:-0.5.0}"
+SDK_VERSION="${CYBERWAVE_SDK_VERSION:-0.5.2}"
 
 SKIP_BASE=false
 PULL_BASE=false

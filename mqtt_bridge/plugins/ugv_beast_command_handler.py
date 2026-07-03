@@ -154,6 +154,19 @@ class UGVBeastActuationHandler(CommandHandler):
             "timestamp": 1706547890.123,
             "source_type": "tele"
         }
+
+        3. Explicit analog velocity (top-level ``velocity_command``):
+        {
+            "command": "move_forward",
+            "source_type": "tele",
+            "timestamp": 1706547890.123,
+            "velocity_command": {
+                "linear_x": 0.6,
+                "linear_y": 0.0,
+                "angular_z": 0.4,
+                "duration_ms": 300
+            }
+        }
         """
         try:
             # Extract the actuation command
@@ -164,16 +177,24 @@ class UGVBeastActuationHandler(CommandHandler):
 
             self.logger.info(f"Processing actuation: {actuation}")
 
-            # Extract additional data if present (for video commands, etc.).
-            # Backend locomotion policy execution publishes velocity_command at
-            # the top level, while older callers may place it under data.
-            command_data = (
-                data
-                if actuation in {"locomotion_velocity", "velocity_command"}
-                else data.get("data", {})
-            )
+            # Analog velocity path. A message may carry an explicit
+            # ``velocity_command`` object (linear_x/angular_z/duration_ms, with or
+            # without the full locomotion contract). When present it is
+            # authoritative: honor the explicit velocities regardless of the
+            # discrete ``command`` string (which may still be a keyboard actuation
+            # like "move_forward"). Backend locomotion policy execution and analog
+            # teleop both use this shape; older callers instead set
+            # command == "velocity_command"/"locomotion_velocity" with the same
+            # top-level object. Both routes converge on the locomotion handler.
+            if isinstance(data.get("velocity_command"), dict) or actuation in {
+                "locomotion_velocity",
+                "velocity_command",
+            }:
+                return self._send_locomotion_velocity(data)
 
-            return self._process_actuation(actuation, command_data)
+            # Otherwise it is a discrete command-mode actuation; per-command data
+            # (camera/lights/video params) lives under ``data``.
+            return self._process_actuation(actuation, data.get("data", {}))
 
         except Exception as e:
             self.logger.error(f"Failed to handle actuation: {e}")
@@ -211,12 +232,9 @@ class UGVBeastActuationHandler(CommandHandler):
     def _handle_start_video(self, data: Dict[str, Any]) -> bool:
         try:
             if hasattr(self.node, "start_camera_stream"):
-                recording = True
-                if isinstance(data, dict):
-                    recording = data.get("recording", True)
-
-                self.logger.info(f"Starting video stream (recording={recording})")
-                self.node.start_camera_stream(recording=recording)
+                kwargs = CameraCommandHandler._stream_kwargs(data)
+                self.logger.info(f"Starting video stream ({kwargs or 'defaults'})")
+                self.node.start_camera_stream(**kwargs)
                 self.publish_simple_response({"status": "ok", "type": "video_started"})
                 return True
 
@@ -1261,14 +1279,51 @@ class CameraCommandHandler(CommandHandler):
     def _setup_publishers(self) -> None:
         pass
 
+    @staticmethod
+    def _stream_kwargs(data: Any) -> Dict[str, Any]:
+        """Extract optional {recording,format/pixel_format,width,height,fps} from data."""
+        if not isinstance(data, dict):
+            return {}
+        kwargs: Dict[str, Any] = {}
+        if "recording" in data:
+            kwargs["recording"] = bool(data.get("recording"))
+        fmt = data.get("pixel_format") or data.get("format")
+        if fmt:
+            kwargs["pixel_format"] = str(fmt)
+        for src, dst in (("width", "width"), ("image_width", "width"),
+                         ("height", "height"), ("image_height", "height")):
+            if data.get(src) is not None:
+                kwargs[dst] = int(data[src])
+        if data.get("fps") is not None:
+            kwargs["fps"] = int(data["fps"])
+        return kwargs
+
     def handle(self, data: Any) -> bool:
-        # Commands from FE: "start_video" or "stop_video"
+        # Commands from FE: "start_video", "stop_video", "set_camera_format"
         if self._command_name == "start_video":
-            self.node.start_camera_stream()
+            # Pass through any requested format/resolution/fps/recording so the
+            # frontend can select a stream profile (previously dropped).
+            self.node.start_camera_stream(**self._stream_kwargs(data))
             self.publish_response({"status": "ok", "type": "video_started"})
         elif self._command_name == "stop_video":
             self.node.stop_camera_stream()
             self.publish_response({"status": "ok", "type": "video_stopped"})
+        elif self._command_name == "set_camera_format":
+            if not hasattr(self.node, "set_camera_format"):
+                self.publish_response(
+                    {"status": "error", "message": "set_camera_format not supported"}
+                )
+                return False
+            d = data if isinstance(data, dict) else {}
+            result = self.node.set_camera_format(
+                pixel_format=d.get("pixel_format") or d.get("format"),
+                width=d.get("width") or d.get("image_width"),
+                height=d.get("height") or d.get("image_height"),
+                fps=d.get("fps"),
+            )
+            # Node returns a structured dict (applied config or validation error).
+            self.publish_response(result if isinstance(result, dict) else {"status": "ok"})
+            return bool(isinstance(result, dict) and result.get("status") != "error")
         return True
 
 
@@ -1429,6 +1484,8 @@ class CommandRegistry:
         # Register specialized camera handlers for start/stop to match FE button
         self.register_handler_instance(CameraCommandHandler(self.node, "start_video"))
         self.register_handler_instance(CameraCommandHandler(self.node, "stop_video"))
+        # Runtime format/resolution/fps selection (managed relaunch in the node).
+        self.register_handler_instance(CameraCommandHandler(self.node, "set_camera_format"))
 
     def register_handler(self, handler_class: type) -> None:
         """

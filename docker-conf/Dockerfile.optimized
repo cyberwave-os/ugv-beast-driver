@@ -14,7 +14,7 @@
 #
 # NOTE: the build context is cyberwave-edge-nodes (the parent dir), so the
 # shared cyberwave-edge-common package is in scope. Cyberwave SDK is installed
-# from PyPI in the runtime_base stage (CYBERWAVE_SDK_VERSION, default 0.5.0).
+# from PyPI in the runtime_base stage (CYBERWAVE_SDK_VERSION, default 0.5.2).
 #
 # Build/publish base once:
 #   docker buildx build --target ugv_driver_base \
@@ -24,7 +24,7 @@
 # Fast rebuild (SDK or mqtt_bridge changes only):
 #   docker buildx build \
 #     --build-arg UGV_DRIVER_BASE_IMAGE=cyberwaveos/ugv-driver:base-dev \
-#     --build-arg CYBERWAVE_SDK_VERSION=0.5.0 \
+#     --build-arg CYBERWAVE_SDK_VERSION=0.5.2 \
 #     -f cyberwave-edge-ros-ugv/docker-conf/Dockerfile.optimized \
 #     -t cyberwaveos/ugv-driver:dev --push .
 #
@@ -150,7 +150,7 @@ LABEL version="1.0"
 # ============================================================================
 # STAGE 5: Install Cyberwave SDK (fast-changing layer)
 # ============================================================================
-ARG CYBERWAVE_SDK_VERSION=0.5.0
+ARG CYBERWAVE_SDK_VERSION=0.5.2
 RUN bash -c "pip_args=(--no-cache-dir --prefer-binary); \
     if pip3 install --help 2>&1 | grep -q break-system-packages; then \
     pip_args+=(--break-system-packages); \
@@ -192,6 +192,18 @@ RUN printf '%s\n' \
     'fi' \
     > /usr/local/bin/source_ros_setup.sh && chmod +x /usr/local/bin/source_ros_setup.sh
 
+# Helper: materialize colcon --symlink-install symlinks into real files.
+# colcon's --symlink-install makes install/<pkg>/share/... entries symlinks that
+# point INTO build/<pkg>/... So before we delete build/ (to keep image layers
+# small — deletions only reclaim space *within the layer that created the bytes*)
+# we replace each such symlink with a real copy of its target. Runs in /bin/sh,
+# so it must avoid bashisms (no `read -d`); find -exec is POSIX-safe.
+RUN printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'root="${1:-.}"' \
+    'find "$root" -type l -exec sh -c '"'"'for l in "$@"; do t=$(readlink -f "$l"); if [ -f "$t" ]; then cp -f --remove-destination "$t" "$l"; fi; done'"'"' sh {} +' \
+    > /usr/local/bin/materialize_symlinks.sh && chmod +x /usr/local/bin/materialize_symlinks.sh
+
 # ============================================================================
 # STAGE 7: Clone UGV Workspace Repository
 # ============================================================================
@@ -203,6 +215,23 @@ WORKDIR /home/ws
 
 # Clone ugv_ws repository (ros2-humble-develop branch) with retries.
 # If the base image already provides /home/ws/ugv_ws, reuse it.
+#
+# The clone + prune happen in ONE layer on purpose: deleting .git or unused
+# packages in a *later* layer reclaims nothing (the bytes still ship in this
+# layer). `--depth 1` avoids fetching history we immediately drop. After the
+# workspace exists we remove .git (~150 MB of dead history) and the source of
+# every package the driver never builds or launches (see STAGE 10b). The kept
+# set — ugv_main/{ugv_bringup,ugv_base_node,ugv_description,ugv_interface,
+# ugv_vision} and ugv_else/ldlidar — is what the launch + boot-time rebuilds
+# need. mqtt_bridge source is COPY-ed in separately (STAGE 8).
+#
+# REMOVED ugv beast packages (kept here as a comment so the full set is
+# documented and any can be re-enabled — add it back to STAGE 10b's
+# --packages-select AND drop it from the prune lists below):
+#   ugv_main/{ugv_chat_ai,ugv_gazebo,ugv_nav,ugv_slam,ugv_tools,ugv_web_app}
+#   ugv_else/{apriltag_ros,cartographer,costmap_converter,emcl2_ros2,
+#             explore_lite,gmapping,rf2o_laser_odometry,robot_pose_publisher,
+#             teb_local_planner,vizanti}
 RUN bash -c " \
     if [ -d /home/ws/ugv_ws/src/ugv_main ] || [ -d /home/ws/ugv_ws/.git ]; then \
     echo 'Using existing /home/ws/ugv_ws from base image'; \
@@ -210,13 +239,22 @@ RUN bash -c " \
     if [ -d /home/ws/ugv_ws ]; then rm -rf /home/ws/ugv_ws; fi; \
     clone_ok=0; \
     for i in {1..5}; do \
-    git clone -b ros2-humble-develop https://github.com/DUDULRX/ugv_ws.git /home/ws/ugv_ws && clone_ok=1 && break || { \
+    git clone --depth 1 -b ros2-humble-develop https://github.com/DUDULRX/ugv_ws.git /home/ws/ugv_ws && clone_ok=1 && break || { \
     echo 'Clone attempt '\$i' failed, retrying in 10 seconds...'; \
     sleep 10; \
     }; \
     done; \
     [ \"\$clone_ok\" -eq 1 ] || { echo 'ERROR: failed to clone ugv_ws after 5 attempts'; exit 1; }; \
-    fi"
+    fi; \
+    echo '● Pruning ugv_ws in-layer (.git history + unused packages)...'; \
+    rm -rf /home/ws/ugv_ws/.git; \
+    for pkg in ugv_chat_ai ugv_gazebo ugv_nav ugv_slam ugv_tools ugv_web_app; do \
+    rm -rf \"/home/ws/ugv_ws/src/ugv_main/\$pkg\"; \
+    done; \
+    for pkg in apriltag_ros cartographer costmap_converter emcl2_ros2 explore_lite gmapping rf2o_laser_odometry robot_pose_publisher teb_local_planner vizanti; do \
+    rm -rf \"/home/ws/ugv_ws/src/ugv_else/\$pkg\"; \
+    done; \
+    echo '● ugv_ws pruned'"
 
 # Set working directory to ugv_ws
 WORKDIR /home/ws/ugv_ws
@@ -241,6 +279,8 @@ COPY cyberwave-edge-ros-ugv /home/ws/ugv_ws/src/mqtt_bridge
 # Overwrite specific ugv_bringup files with Cyberwave customizations
 COPY cyberwave-edge-ros-ugv/scripts/ugv_beast/ugv_bringup/launch/master_beast.launch.py /home/ws/ugv_ws/src/ugv_main/ugv_bringup/launch/
 COPY cyberwave-edge-ros-ugv/scripts/ugv_beast/ugv_bringup/ugv_bringup/ugv_integrated_driver.py /home/ws/ugv_ws/src/ugv_main/ugv_bringup/ugv_bringup/
+# ROS-free core logic imported by ugv_integrated_driver (separated for unit testing).
+COPY cyberwave-edge-ros-ugv/scripts/ugv_beast/ugv_bringup/ugv_bringup/ugv_driver_core.py /home/ws/ugv_ws/src/ugv_main/ugv_bringup/ugv_bringup/
 COPY cyberwave-edge-ros-ugv/scripts/ugv_beast/ugv_bringup/setup.py /home/ws/ugv_ws/src/ugv_main/ugv_bringup/setup.py
 
 # Copy startup and service scripts
@@ -255,6 +295,23 @@ RUN echo "=== Verifying setup.py has ugv_integrated_driver ===" && \
     grep -q "ugv_integrated_driver" /home/ws/ugv_ws/src/ugv_main/ugv_bringup/setup.py && \
     echo "=== ugv_integrated_driver entry point confirmed ===" || \
     (echo "ERROR: ugv_integrated_driver not found in setup.py" && exit 1)
+
+# Strip the unused rosidl dependency from ugv_description's CMakeLists.
+# ugv_description is a pure data package — it only installs launch/meshes/urdf/rviz
+# and generates NO interfaces (no msg/srv/action) — yet upstream declares
+# find_package(rosidl_default_generators REQUIRED) + ament_export_dependencies(...).
+# In STAGE 10a's package set, ugv_bringup and ugv_vision are ament_python (no CMake),
+# so ugv_description is the only ament_cmake package, and that spurious rosidl
+# find_package is the one codepath that transitively resolves rcutils' exported
+# library. On the dudulrx0601 base's flaky ament/CMake env (the documented
+# "Package 'rcutils' exports the library 'rcutils' which couldn't be found" error
+# on emulated/parallel CI builds) that resolution fails deterministically and sinks
+# the whole launch-critical build. Removing the unused rosidl lines lets the data
+# package configure cleanly; nothing build-depends on ugv_description's CMake exports.
+RUN if [ -f /home/ws/ugv_ws/src/ugv_main/ugv_description/CMakeLists.txt ]; then \
+    sed -i '/rosidl_default_generators/d' /home/ws/ugv_ws/src/ugv_main/ugv_description/CMakeLists.txt && \
+    echo "● Patched ugv_description/CMakeLists.txt: dropped unused rosidl_default_generators"; \
+    fi
 
 # ============================================================================
 # Build prerequisites for colcon
@@ -320,37 +377,75 @@ RUN bash -c "source /usr/local/bin/source_ros_build.sh && \
     ugv_interface \
     --parallel-workers 1 \
     --executor sequential \
-    --continue-on-error || true"
+    --continue-on-error || true; \
+    rm -rf /home/ws/ugv_ws/build /home/ws/ugv_ws/log"
 
 # Build ugv_base_node separately - critical for odometry
+# (no --symlink-install -> install/ has real files, so build/ is safe to drop)
 RUN bash -c "source /usr/local/bin/source_ros_setup.sh && \
     cd /home/ws/ugv_ws && \
     echo '=== Building ugv_base_node (odometry calculator) ===' && \
     colcon build --packages-select ugv_base_node --parallel-workers 1 && \
     echo '=== ugv_base_node built successfully ===' || \
-    echo 'WARNING: ugv_base_node failed to build - will retry at container startup'"
+    echo 'WARNING: ugv_base_node failed to build - will retry at container startup'; \
+    rm -rf /home/ws/ugv_ws/build /home/ws/ugv_ws/log"
 
 # ============================================================================
 # STAGE 10: Build ROS2 Workspace - Second Pass (Main UGV packages)
 # ============================================================================
-# Kept in full: these are all ugv-specific packages.
+# STAGE 10a - Launch-critical packages (MUST install completely).
+# master_beast.launch.py unconditionally resolves ugv_bringup,
+# ugv_description (reads urdf/ugv_beast.urdf) and ugv_vision (camera params)
+# at launch-description time, so a missing/partial install crashes every
+# driver start. The dudulrx0601 base image's ament/CMake env is flaky under
+# emulated/parallel builds (e.g. "Package 'rcutils' exports the library
+# 'rcutils' which couldn't be found") and can leave a partial install: colcon
+# env hooks present, but ament index marker + share/ payload (incl. the URDF)
+# missing. A bare `--continue-on-error || true` used to swallow that and ship a
+# broken image. Build these isolated and fail-hard, with one clean retry, and
+# verify the actual install artifacts so a broken workspace can never publish.
+RUN bash -c "set -e; source /usr/local/bin/source_ros_setup.sh; cd /home/ws/ugv_ws; \
+    build_critical() { colcon build --packages-select ugv_bringup ugv_description ugv_vision \
+        --parallel-workers 1 --symlink-install --executor sequential; }; \
+    verify_critical() { \
+        test -f install/ugv_bringup/share/ament_index/resource_index/packages/ugv_bringup && \
+        test -f install/ugv_description/share/ament_index/resource_index/packages/ugv_description && \
+        test -f install/ugv_vision/share/ament_index/resource_index/packages/ugv_vision && \
+        test -f install/ugv_description/share/ugv_description/urdf/ugv_beast.urdf; }; \
+    build_critical || true; \
+    if ! verify_critical; then \
+    echo '● Launch-critical packages incomplete after first pass — clean rebuild...'; \
+    rm -rf build/ugv_bringup install/ugv_bringup build/ugv_description install/ugv_description build/ugv_vision install/ugv_vision; \
+    build_critical; \
+    fi; \
+    verify_critical || { echo 'ERROR: launch-critical ROS packages failed to install (ugv_bringup/ugv_description/ugv_vision)'; exit 1; }; \
+    echo '● Materializing --symlink-install symlinks then dropping build/ in-layer...'; \
+    bash /usr/local/bin/materialize_symlinks.sh install; \
+    rm -rf build log; \
+    if find install -xtype l | grep -q .; then echo 'ERROR: dangling symlinks remain in install/ after STAGE 10a'; find install -xtype l; exit 1; fi; \
+    echo '✅ Launch-critical ugv packages installed and verified'"
 
-RUN bash -c "source /usr/local/bin/source_ros_setup.sh && \
-    cd /home/ws/ugv_ws && \
-    colcon build --packages-select \
-    ugv_bringup \
-    ugv_chat_ai \
-    ugv_description \
-    ugv_gazebo \
-    ugv_nav \
-    ugv_slam \
-    ugv_tools \
-    ugv_vision \
-    ugv_web_app \
-    --parallel-workers 1 \
-    --symlink-install \
-    --executor sequential \
-    --continue-on-error || true"
+# STAGE 10b - Remaining ugv packages (not required by the driver launch).
+# DISABLED to shrink the image: master_beast.launch.py and ugv_services_install.sh
+# never reference any of these packages, so building them only adds colcon
+# build/ + install/ artifacts (ugv_gazebo alone pulls ~10 MB of meshes/worlds)
+# to an image that already ships to SD-card-constrained Pis. Their source is
+# pruned in STAGE 7. To re-enable a package, add it back to the --packages-select
+# list here AND drop it from the prune lists in STAGE 7.
+#   ugv_chat_ai \
+#   ugv_gazebo \
+#   ugv_nav \
+#   ugv_slam \
+#   ugv_tools \
+#   ugv_web_app \
+# RUN bash -c "source /usr/local/bin/source_ros_setup.sh && \
+#     cd /home/ws/ugv_ws && \
+#     colcon build --packages-select \
+#     ugv_chat_ai ugv_gazebo ugv_nav ugv_slam ugv_tools ugv_web_app \
+#     --parallel-workers 1 \
+#     --symlink-install \
+#     --executor sequential \
+#     --continue-on-error || true"
 
 # ============================================================================
 # STAGE 11: Build MQTT Bridge Package
@@ -360,7 +455,9 @@ RUN bash -c "source /usr/local/bin/source_ros_setup.sh && \
     cd /home/ws/ugv_ws && \
     if [ -f src/mqtt_bridge/setup.py ]; then \
     colcon build --packages-select mqtt_bridge --symlink-install; \
-    fi"
+    fi; \
+    bash /usr/local/bin/materialize_symlinks.sh /home/ws/ugv_ws/install; \
+    rm -rf /home/ws/ugv_ws/build /home/ws/ugv_ws/log"
 
 # ============================================================================
 # STAGE 12: Set Permissions and Make Scripts Executable
@@ -395,9 +492,40 @@ WORKDIR /home/ws/ugv_ws
 # Expose common ROS ports
 EXPOSE 11311 11345
 
-# Clean-build mqtt_bridge with Release flags using the project script
+# Clean-build mqtt_bridge with Release flags using the project script.
+# clean_build_mqtt.sh rebuilds mqtt_bridge WITHOUT --symlink-install (real files
+# in install/mqtt_bridge), so build/ can be dropped in this same layer with no
+# materialize needed. This is the last writer of build/, so afterwards the image
+# carries no colcon build scratch in any layer.
 RUN bash -c "source /usr/local/bin/source_ros_setup.sh && \
     cd /home/ws/ugv_ws && \
-    bash src/mqtt_bridge/scripts/ugv_beast/clean_build_mqtt.sh --logs"
+    bash src/mqtt_bridge/scripts/ugv_beast/clean_build_mqtt.sh --logs; \
+    rm -rf /home/ws/ugv_ws/build /home/ws/ugv_ws/log"
+
+# ============================================================================
+# STAGE 14: Final integrity guard
+# ============================================================================
+# The space-saving work now happens IN the layers that create the bytes
+# (deletions in a later layer reclaim nothing — they only add a whiteout while
+# the bytes still ship in the lower layer). So slimming is distributed:
+#   - STAGE 7  : .git history + unused-package source removed in the clone layer.
+#   - STAGE 9/10a/11 + final clean_build : colcon build/ + log/ removed in each
+#     producing layer; --symlink-install packages (ugv_bringup/ugv_description/
+#     ugv_vision/mqtt_bridge) are materialized into real files first via
+#     /usr/local/bin/materialize_symlinks.sh so install/ stays valid without
+#     build/. STAGE 10b (unused nav/SLAM/gazebo/...) is not built at all.
+# This stage is only a cheap fail-hard assertion: if any dangling symlink slipped
+# through, ros2 pkg list / get_package_share_directory would fail at boot, so we
+# abort the build here instead of shipping a broken image.
+RUN set -e; cd /home/ws/ugv_ws; \
+    if [ -d build ] || [ -d log ] || [ -d .git ]; then \
+    echo "WARNING: leftover scratch present (build/log/.git) — removing (note: only saves space if in-layer)"; \
+    rm -rf build log .git; \
+    fi; \
+    if find install -xtype l | grep -q .; then \
+    echo "ERROR: dangling symlinks remain in install/ (a --symlink-install pkg was not materialized before build/ removal):"; \
+    find install -xtype l; exit 1; \
+    fi; \
+    echo "✅ Workspace integrity verified: no dangling install/ symlinks, no build scratch"
 
 ENTRYPOINT ["/home/ws/ugv_ws/ugv_services_install.sh"]

@@ -76,31 +76,78 @@ capabilities:
 # Command Registry class for this robot
 command_registry: "mqtt_bridge.plugins.ugv_beast_command_handler.CommandRegistry"
 
-# Camera streaming configuration (teleop: usb_cam /image_raw → mqtt_bridge WebRTC; image_proc off by default)
+# Camera streaming configuration — SINGLE SOURCE OF TRUTH for the camera.
+# The mqtt_bridge owns the usb_cam lifecycle (managed_by_bridge) and publishes
+# /image_raw; ROSVideoStreamTrack re-encodes to yuv420p for WebRTC.
+#
+# IMPORTANT (USB-2 bandwidth): uncompressed YUYV cannot sustain high resolution
+# on the Pi's USB bus (e.g. 1080p YUYV would need ~124 MB/s). MJPG is compressed,
+# so it is the ONLY way to stream the higher resolutions/fps the camera advertises.
+# Default capture is therefore MJPG 1920x1080@30; the bridge adapts down under CPU
+# pressure (reduce fps to fps_floor, THEN shrink dimension — never below fps_floor).
 camera:
   # ROS2 image topic to stream via WebRTC
   image_topic: "/image_raw"
-  # Video frame format. Potential alternatives:
-  # - "yuv420p": Standard WebRTC format, highly compatible (Default)
-  # - "rgb24": Raw RGB format (requires conversion in most browsers)
-  # - "bgr24": Raw BGR format (standard OpenCV format)
-  # - "nv12": Common hardware-accelerated format
+  # WebRTC wire format produced by the bridge track (kept for compatibility).
   format: "yuv420p"
-  encoding: "rgb8"
-  fps: 15 # Match webrtc.fps; lower both if USB or network is congested
-  image_width: 640 # Match actual camera resolution
-  image_height: 480 # Match actual camera resolution
-  # Hardware camera settings for ugv_vision (usb_cam)
-  video_device: "/dev/video0"
+  # The bridge owns the usb_cam process (kill/wait-device-free/relaunch). Set
+  # false to fall back to launching usb_cam from master_beast.launch.py instead.
+  managed_by_bridge: true
+  # Hardware camera device. "auto" => resolve the real USB camera via v4l2-ctl
+  # (device_utils), robust to the /dev/video* index changing between boots/replugs.
+  video_device: "auto"
   io_method: "mmap"
   frame_id: "pt_camera_link"
-  pixel_format: "yuyv"
+  camera_name: "pt_camera"
+  camera_info_url: "package://ugv_vision/config/camera_info.yaml"
+
+  # --- Default capture format ---
+  # Benchmarked best for this hardware (Pi 5, software H.264 — no HW encoder):
+  # MJPG 1280x720@30 sustains comfortably with headroom for the ROS stack, while
+  # 1080p only does ~33 fps software. 1080p remains selectable at runtime via
+  # set_camera_format (it's in supported_formats) and is the adaptation ceiling.
+  # See scripts/ugv_beast/benchmark_camera.py.
+  pixel_format: "mjpeg2rgb" # MJPG decoded to rgb8; survives USB2 at high res
+  image_width: 1280
+  image_height: 720
+  capture_fps: 30 # what usb_cam captures
+  stream_fps: 30 # default WebRTC send rate (adaptation trims to fps_floor under load)
+
   # Auto-features - set to true if camera supports them, false otherwise
   auto_white_balance: true
   autoexposure: true
   autofocus: false # Most USB webcams don't have motorized autofocus
-  camera_name: "pt_camera"
-  camera_info_url: "package://ugv_vision/config/camera_info.yaml"
+
+  # --- Capability table: the driver validates runtime selections against this ---
+  # YUYV is uncompressed, so it is only sane at <=640x480 on USB2.
+  supported_formats:
+    mjpeg2rgb:
+      sizes: [[1920, 1080], [1280, 960], [1280, 720], [1024, 768], [800, 600], [640, 480], [352, 288], [320, 240], [160, 120]]
+      max_fps: 30
+    yuyv:
+      sizes: [[640, 480]]
+      max_fps: 30
+
+  # --- Dynamic adaptation (bridge-side; applied WITHOUT touching the camera) ---
+  # Rule: drop fps to fps_floor FIRST, then only shrink dimension. Never < fps_floor.
+  adaptation:
+    enabled: true
+    cpu_high: 85 # CPU% (EMA) -> step DOWN a rung
+    cpu_low: 55 # CPU% (EMA), held -> step UP a rung
+    fps_floor: 15 # hard floor: never send below this fps
+    check_period_s: 2.0
+    cooldown_s: 10.0 # min dwell before stepping back up (anti-flap)
+    # The ladder is clamped at runtime to the active capture format (clamp_ladder),
+    # so with the 1280x720@30 default it becomes 720p30 -> 720p15 -> 800x600 -> 640x480.
+    # Rungs above the capture size are harmlessly clamped down; if you raise the
+    # capture (e.g. set_camera_format to 1080p) the higher rungs become active.
+    target: [1280, 720, 30]
+    ladder: # [width, height, fps] best -> worst
+      - [1920, 1080, 30]
+      - [1920, 1080, 15] # fps reduced to floor; dimension unchanged
+      - [1280, 720, 15] # from here only dimension shrinks; fps stays at floor
+      - [800, 600, 15]
+      - [640, 480, 15]
 
 # Internal Odometry calculation settings (for robots without /odom topic)
 internal_odometry:

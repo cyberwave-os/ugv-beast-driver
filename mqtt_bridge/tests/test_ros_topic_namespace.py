@@ -19,11 +19,24 @@ class TestResolveRosNamespace:
             == "custom/ns"
         )
 
-    def test_falls_back_to_twin_uuid(self) -> None:
-        assert resolve_ros_namespace(twin_uuid=TWIN_UUID) == TWIN_UUID
+    def test_derives_namespace_from_twin_uuid(self) -> None:
+        # ugv_beast_ + first 6 hex chars of the uuid; the prefix guarantees a
+        # ROS-valid leading letter (a raw UUID is an invalid ROS name).
+        assert resolve_ros_namespace(twin_uuid=TWIN_UUID) == "ugv_beast_000000"
+        assert resolve_ros_namespace(twin_uuid="27dca72f-6e17-4cb4") == "ugv_beast_27dca7"
+
+    def test_configured_namespace_wins_over_twin_uuid(self) -> None:
+        assert (
+            resolve_ros_namespace(configured_namespace="custom_ns", twin_uuid=TWIN_UUID)
+            == "custom_ns"
+        )
 
     def test_returns_empty_when_unconfigured(self) -> None:
         assert resolve_ros_namespace() == ""
+
+    def test_sanitizes_invalid_configured_namespace(self) -> None:
+        # Hyphens -> '_'; a leading digit is prefixed so the token is ROS-valid.
+        assert resolve_ros_namespace(configured_namespace="12-ab/c-d") == "_12_ab/c_d"
 
 
 class TestResolveRosTopic:

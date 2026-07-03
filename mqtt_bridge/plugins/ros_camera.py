@@ -7,13 +7,24 @@ import logging
 
 import cv2
 import numpy as np
-from av import VideoFrame
 from rclpy.node import Node
 from sensor_msgs.msg import Image
 
 from cyberwave.camera import BaseVideoTrack, BaseVideoStreamer
 from aiortc.rtcicetransport import RTCIceGatherer, connection_kwargs
 from aioice import Connection, TransportPolicy
+
+from . import camera_frame as cf
+from .camera_adaptation import AdaptationConfig, AdaptationController
+
+# Fixed 90 kHz presentation clock: wall-clock-derived pts keeps timestamps
+# continuous when the adaptive controller changes send fps at runtime.
+_PTS_CLOCK_HZ = 90000
+
+# Absolute last-resort size for the blank pre-roll frame, used ONLY if neither
+# the camera config nor a received frame has provided a size yet. Real dimensions
+# come from the camera config and are corrected from the first frame.
+_LAST_RESORT_SIZE = (640, 480)
 
 logger = logging.getLogger(__name__)
 
@@ -69,12 +80,32 @@ class ROSVideoStreamTrack(BaseVideoTrack):
     """
     Video stream track that gets frames from a ROS 2 topic.
     """
-    def __init__(self, node: Node, topic: str = "/image_raw", fps: int = 30):
+    def __init__(
+        self,
+        node: Node,
+        topic: str = "/image_raw",
+        fps: int = 30,
+        width: Optional[int] = None,
+        height: Optional[int] = None,
+    ):
         super().__init__()
         self.node = node
-        self.topic = topic
+        # Resolve the (logical) image topic through the node's per-robot ROS
+        # namespace — exactly like every other bridge topic (resolve_ros_topic) —
+        # so the subscription matches the namespaced /image_raw the usb_cam node
+        # publishes. Without this, video silently never arrives in a namespaced
+        # (fleet) deployment. self.topic is the resolved name everywhere below.
+        # Falls back to the raw topic if the node exposes no resolver.
+        resolve = getattr(node, "resolve_ros_topic", None)
+        self.topic = resolve(topic) if callable(resolve) else topic
         self.fps = fps
         self.encoding = "yuv420p"
+        # Adaptive knobs (set by the controller): _target_fps = WebRTC send rate,
+        # _scale = pre-encode downscale. Bridge-side only; never touch the camera.
+        self._target_fps = float(fps)
+        self._scale = 1.0
+        self._quality_lock = threading.Lock()
+        self._last_pts = -1
         self.latest_frame = None
         self.latest_frame_encoding: Optional[str] = None
         self._frame_lock = threading.Lock()
@@ -83,15 +114,18 @@ class ROSVideoStreamTrack(BaseVideoTrack):
         self._frames_received = 0
         self._frame_ready_event = threading.Event()
         
-        # Dimensions from config or default
-        self.actual_width = 640
-        self.actual_height = 480
-        if hasattr(self.node, '_mapping') and self.node._mapping:
+        # Initial dimensions: explicit args (from the streamer's camera config),
+        # else the mapping's camera block. May stay None until the first frame —
+        # _image_callback sets the authoritative size from the frame itself.
+        self.actual_width = width
+        self.actual_height = height
+        if (self.actual_width is None or self.actual_height is None) and \
+                hasattr(self.node, '_mapping') and self.node._mapping:
             camera_config = self.node._mapping.raw.get('camera', {})
-            self.actual_width = camera_config.get('image_width', 640)
-            self.actual_height = camera_config.get('image_height', 480)
-        
-        # Subscribe to ROS image topic
+            self.actual_width = self.actual_width or camera_config.get('image_width')
+            self.actual_height = self.actual_height or camera_config.get('image_height')
+
+        # Subscribe to the ROS image topic (already namespace-resolved above).
         self.subscription = self.node.create_subscription(
             Image, self.topic, self._image_callback, 10
         )
@@ -145,13 +179,31 @@ class ROSVideoStreamTrack(BaseVideoTrack):
         except Exception as e:
             self.node.get_logger().error(f"Error processing ROS image: {e}")
 
+    def set_quality(self, fps: Optional[float] = None, scale: Optional[float] = None) -> None:
+        """Set the adaptive send rate / downscale (thread-safe). fps clamped >=1,
+        scale to (0.05, 1.0]; applies from the next recv()."""
+        with self._quality_lock:
+            if fps is not None:
+                self._target_fps = max(1.0, float(fps))
+            if scale is not None:
+                self._scale = min(1.0, max(0.05, float(scale)))
+
+    def get_quality(self) -> tuple:
+        with self._quality_lock:
+            return self._target_fps, self._scale
+
     def get_stream_attributes(self) -> Dict[str, Any]:
+        target_fps, scale = self.get_quality()
+        if self.actual_width and self.actual_height:
+            width, height = cf.scaled_size(self.actual_width, self.actual_height, scale)
+        else:
+            width = height = 0  # unknown until the first frame / config
         return {
             "camera_type": "ros",
             "camera_id": self.topic,
-            "width": self.actual_width,
-            "height": self.actual_height,
-            "fps": self.fps,
+            "width": width,
+            "height": height,
+            "fps": int(round(target_fps)),
         }
     
     def wait_for_frames(self, timeout: float = 5.0) -> bool:
@@ -183,17 +235,6 @@ class ROSVideoStreamTrack(BaseVideoTrack):
             return cv2.cvtColor(frame_data, cv2.COLOR_RGB2BGR)
         return frame_data.copy()
 
-    @staticmethod
-    def _to_yuv420p_video_frame(frame_data: np.ndarray, encoding: str) -> VideoFrame:
-        if encoding in _YUYV_ENCODINGS or encoding == "yuyv":
-            video_frame = VideoFrame.from_ndarray(frame_data, format="yuyv422")
-        elif encoding == "rgb8":
-            bgr = cv2.cvtColor(frame_data, cv2.COLOR_RGB2BGR)
-            video_frame = VideoFrame.from_ndarray(bgr, format="bgr24")
-        else:
-            video_frame = VideoFrame.from_ndarray(frame_data, format="bgr24")
-        return video_frame.reformat(format="yuv420p")
-
     async def recv(self):
         # Wait for at least one frame to be ready before starting WebRTC streaming
         if self.frame_count == 0:
@@ -209,30 +250,32 @@ class ROSVideoStreamTrack(BaseVideoTrack):
             else:
                 self.node.get_logger().info(f"First frame ready on {self.topic}, starting WebRTC transmission")
         
-        # Frame rate control (skip for first frame to avoid SDK timeout)
+        target_fps, scale = self.get_quality()
+
+        # Pace at the adaptive send rate (skip first frame to avoid SDK timeout).
         if self.frame_count > 0:
             now = time.time()
             if self._last_time is not None:
-                wait = max(0, (1.0 / self.fps) - (now - self._last_time))
+                wait = max(0, (1.0 / target_fps) - (now - self._last_time))
                 if wait > 0:
                     await asyncio.sleep(wait)
         self._last_time = time.time()
 
         self.frame_count += 1
-        pts = self.frame_count
-        time_base = fractions.Fraction(1, int(self.fps))
-        
+
         with self._frame_lock:
             frame_data = self.latest_frame
             frame_encoding = self.latest_frame_encoding
             frames_received = self._frames_received
 
         if frame_data is None:
-            # Create blank gray frame if no data available
+            # Blank gray pre-roll frame; size from config, else last-resort default.
+            bw = self.actual_width or _LAST_RESORT_SIZE[0]
+            bh = self.actual_height or _LAST_RESORT_SIZE[1]
             self.node.get_logger().warning(
-                f"Frame {self.frame_count}: No frame data available, sending blank frame (received {frames_received} total)"
+                f"Frame {self.frame_count}: No frame data available, sending blank {bw}x{bh} frame (received {frames_received} total)"
             )
-            frame_data = np.full((self.actual_height, self.actual_width, 3), 128, dtype=np.uint8)
+            frame_data = np.full((bh, bw, 3), 128, dtype=np.uint8)
             frame_encoding = "bgr8"
         elif self.frame_count == 1:
             self.node.get_logger().info(
@@ -243,7 +286,7 @@ class ROSVideoStreamTrack(BaseVideoTrack):
             self.node.get_logger().debug(
                 f"Frame {self.frame_count}: Sending frame to WebRTC ({frames_received} total received)"
             )
-            
+
         now = time.time()
         now_monotonic = time.monotonic()
 
@@ -251,7 +294,18 @@ class ROSVideoStreamTrack(BaseVideoTrack):
             self.frame_0_timestamp = now
             self.frame_0_timestamp_monotonic = now_monotonic
 
-        frame = self._to_yuv420p_video_frame(frame_data, frame_encoding or "bgr8")
+        # Wall-clock pts in a fixed 90 kHz time_base (robust to dynamic fps).
+        time_base = fractions.Fraction(1, _PTS_CLOCK_HZ)
+        pts = int(round((now_monotonic - self.frame_0_timestamp_monotonic) * _PTS_CLOCK_HZ))
+        if pts <= self._last_pts:
+            pts = self._last_pts + 1
+        self._last_pts = pts
+
+        # Convert+downscale off the event loop so a big frame can't stall signaling.
+        loop = asyncio.get_event_loop()
+        frame = await loop.run_in_executor(
+            None, cf.encode_yuv420p, frame_data, frame_encoding or "bgr8", scale
+        )
         frame.pts = pts
         frame.time_base = time_base
 
@@ -267,9 +321,14 @@ class ROSVideoStreamTrack(BaseVideoTrack):
             time_base_den=time_base.denominator,
         )
 
-        # Keyframe every 4 seconds or first 10 frames
-        if self.frame_count % (int(self.fps) * 4) == 1 or self.frame_count < 10:
-            frame.key_frame = True
+        # Keyframe ~every 4s or first 10 frames. key_frame is read-only in some av
+        # versions and only a hint, so guard it.
+        keyframe_interval = max(1, int(round(target_fps)) * 4)
+        if self.frame_count % keyframe_interval == 1 or self.frame_count < 10:
+            try:
+                frame.key_frame = True
+            except (AttributeError, TypeError):
+                pass
 
         return frame
 
@@ -320,12 +379,27 @@ class ROSCameraStreamer(BaseVideoStreamer):
         self.node = node
 
         # Get camera settings from robot mapping (preferred) or fall back to defaults
+        camera_config: Dict[str, Any] = {}
         if hasattr(self.node, '_mapping') and self.node._mapping:
             camera_config = self.node._mapping.raw.get('camera', {})
             self.image_topic = camera_config.get('image_topic', '/image_raw')
-            self.fps = camera_config.get('fps', self.fps)
+            # Prefer the explicit WebRTC send rate; fall back to legacy 'fps'.
+            self.fps = camera_config.get('stream_fps', camera_config.get('fps', self.fps))
         else:
             self.image_topic = "/image_raw"
+
+        # CPU-driven adaptation (bridge-side downscale + send-fps throttle).
+        self._adapt_cfg = AdaptationConfig.from_mapping(camera_config)
+        self._adapt_enabled = bool(
+            (camera_config.get('adaptation', {}) or {}).get('enabled', False)
+            and self._adapt_cfg.ladder
+        )
+        # Capture resolution -> aspect-preserving downscale factor for the resize.
+        self._capture_w = int(camera_config.get('image_width', 1920) or 1920)
+        self._capture_h = int(camera_config.get('image_height', 1080) or 1080)
+        self._pixel_format = camera_config.get('pixel_format', 'mjpeg2rgb')
+        self._adaptation: Optional[AdaptationController] = None
+        self._adaptation_task = None
 
         mode_str = " (TURN relay-only)" if self.force_relay else ""
         self.node.get_logger().info(
@@ -337,8 +411,37 @@ class ROSCameraStreamer(BaseVideoStreamer):
         """Required by BaseVideoStreamer: create the video track."""
         if self.streamer is not None:
             return self.streamer
-        self.streamer = ROSVideoStreamTrack(self.node, self.image_topic, self.fps)
+        self.streamer = ROSVideoStreamTrack(
+            self.node, self.image_topic, self.fps,
+            width=self._capture_w, height=self._capture_h,
+        )
         return self.streamer
+
+    def _build_stream_config(self) -> Optional[Dict[str, Any]]:
+        """Effective (post-adaptation) stream config for the SDK health heartbeat:
+        live format/resolution/send fps/scale + current rung and CPU load."""
+        track = self.streamer
+        if track is None:
+            return None
+        try:
+            target_fps, scale = track.get_quality()
+            width, height = cf.scaled_size(track.actual_width, track.actual_height, scale)
+            cfg: Dict[str, Any] = {
+                "kind": "ros_webrtc",
+                "source": self.image_topic,
+                "pixel_format": self._pixel_format,
+                "width": width,
+                "height": height,
+                "actual_fps": int(round(target_fps)),
+                "scale": round(float(scale), 3),
+            }
+            if self._adaptation is not None:
+                cfg["ladder_step"] = self._adaptation.index
+                if self._adaptation.cpu_ema is not None:
+                    cfg["cpu_ema"] = round(float(self._adaptation.cpu_ema), 1)
+            return cfg
+        except Exception:
+            return None
 
     async def start(self, *args, **kwargs):
         """
@@ -366,7 +469,71 @@ class ROSCameraStreamer(BaseVideoStreamer):
                 "No camera frames after 10s wait. Starting WebRTC anyway (will send blank frames)"
             )
 
-        # Delegate entirely to the SDK's WebRTC setup — do not override signaling
-        # internals (_subscribe_to_answer, _send_offer, _wait_for_answer) as they
-        # can race with the SDK's own state machine on reconnect.
-        return await super().start(*args, **kwargs)
+        # Delegate to the SDK's WebRTC setup (don't override its signaling — races
+        # with the SDK state machine on reconnect).
+        result = await super().start(*args, **kwargs)
+        self._start_adaptation()
+        return result
+
+    async def stop(self, *args, **kwargs):
+        self._stop_adaptation()
+        return await super().stop(*args, **kwargs)
+
+    # --------------------------------------------------------- CPU adaptation
+    def _apply_rung(self, rung) -> None:
+        """Apply a ladder rung to the live track as (fps, aspect-preserving scale)."""
+        if self.streamer is None:
+            return
+        width, height, fps = rung
+        cap_w = getattr(self.streamer, "actual_width", 0) or self._capture_w
+        cap_h = getattr(self.streamer, "actual_height", 0) or self._capture_h
+        scale = 1.0
+        if cap_w and cap_h:
+            scale = min(1.0, min(width / float(cap_w), height / float(cap_h)))
+        self.streamer.set_quality(fps=fps, scale=scale)
+        self.node.get_logger().info(
+            f"Adaptation: rung {width}x{height}@{fps} -> scale={scale:.3f} on {cap_w}x{cap_h} capture"
+        )
+
+    def _start_adaptation(self) -> None:
+        if not self._adapt_enabled or self.streamer is None:
+            return
+        if self._adaptation_task is not None and not self._adaptation_task.done():
+            return
+        self._adaptation = AdaptationController(
+            self._adapt_cfg, apply_fn=self._apply_rung, clock=time.monotonic
+        )
+        self._adaptation_task = asyncio.ensure_future(self._run_adaptation())
+        self.node.get_logger().info(
+            f"CPU adaptation started (cpu_high={self._adapt_cfg.cpu_high}, "
+            f"fps_floor={self._adapt_cfg.fps_floor}, rungs={len(self._adapt_cfg.ladder or [])})"
+        )
+
+    def _stop_adaptation(self) -> None:
+        task = self._adaptation_task
+        self._adaptation_task = None
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _run_adaptation(self) -> None:
+        try:
+            import psutil
+        except Exception as exc:  # pragma: no cover - psutil always present in container
+            self.node.get_logger().warning(f"psutil unavailable, adaptation disabled: {exc}")
+            return
+        psutil.cpu_percent(None)  # prime the first (meaningless) sample
+        try:
+            while self.pc is not None and self.streamer is not None:
+                await asyncio.sleep(self._adapt_cfg.check_period_s)
+                try:
+                    cpu = psutil.cpu_percent(None)
+                    changed = self._adaptation.update_cpu(cpu)
+                    if changed is not None:
+                        self.node.get_logger().info(
+                            f"CPU {cpu:.0f}% (ema {self._adaptation.cpu_ema:.0f}) "
+                            f"-> rung {self._adaptation.index} {changed}"
+                        )
+                except Exception as exc:
+                    self.node.get_logger().debug(f"adaptation tick error: {exc}")
+        except asyncio.CancelledError:
+            pass

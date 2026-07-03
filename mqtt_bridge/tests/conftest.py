@@ -127,7 +127,76 @@ def _install_ros_stubs() -> None:
         sys.modules[name] = module
 
 
+def _install_camera_stubs() -> None:
+    """Stub the cyberwave SDK camera base + sensor_msgs.Image for camera tests.
+
+    Uses the REAL aiortc VideoStreamTrack as the BaseVideoTrack base when aiortc
+    is installed (so the e2e loopback works); otherwise stubs aiortc/aioice just
+    enough for ros_camera to import. Installed once, consistently, so test files
+    don't fight over sys.modules.
+    """
+    sm = sys.modules.get("sensor_msgs.msg")
+    if sm is not None and not hasattr(sm, "Image"):
+        sm.Image = type("Image", (), {})
+
+    base: Any = object
+    try:
+        from aiortc import VideoStreamTrack as _VST  # real aiortc if present
+
+        base = _VST
+    except Exception:
+        if "aiortc.rtcicetransport" not in sys.modules:
+            aiortc = sys.modules.get("aiortc") or types.ModuleType("aiortc")
+            rtcice = types.ModuleType("aiortc.rtcicetransport")
+            rtcice.RTCIceGatherer = type("RTCIceGatherer", (), {})
+            rtcice.connection_kwargs = lambda servers: {}
+            aiortc.rtcicetransport = rtcice
+            sys.modules["aiortc"] = aiortc
+            sys.modules["aiortc.rtcicetransport"] = rtcice
+        if "aioice" not in sys.modules:
+            aioice = types.ModuleType("aioice")
+            aioice.Connection = type("Connection", (), {})
+            aioice.TransportPolicy = type("TransportPolicy", (), {"RELAY": "relay"})
+            sys.modules["aioice"] = aioice
+
+    if "cyberwave.camera" not in sys.modules:
+        cyberwave = sys.modules.get("cyberwave") or types.ModuleType("cyberwave")
+        cam = types.ModuleType("cyberwave.camera")
+
+        class BaseVideoTrack(base):  # type: ignore[misc,valid-type]
+            def __init__(self) -> None:
+                if base is not object:
+                    super().__init__()
+                self.frame_count = 0
+                self.frame_0_timestamp = None
+                self.frame_0_timestamp_monotonic = None
+                self.sync_frame_target = 30
+                self.sync_frame_pts = None
+
+            def _capture_sync_frame(self, *a: Any, **k: Any) -> None:
+                pass
+
+            def stop(self) -> None:
+                parent_stop = getattr(super(), "stop", None)
+                if callable(parent_stop):
+                    try:
+                        parent_stop()
+                    except Exception:
+                        pass
+
+        class BaseVideoStreamer:
+            def __init__(self, *a: Any, **k: Any) -> None:
+                self.streamer = None
+
+        cam.BaseVideoTrack = BaseVideoTrack
+        cam.BaseVideoStreamer = BaseVideoStreamer
+        cyberwave.camera = cam
+        sys.modules["cyberwave"] = cyberwave
+        sys.modules["cyberwave.camera"] = cam
+
+
 _install_ros_stubs()
+_install_camera_stubs()
 
 
 @dataclass

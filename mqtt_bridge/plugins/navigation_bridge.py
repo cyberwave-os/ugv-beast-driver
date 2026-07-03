@@ -526,6 +526,10 @@ class NavigationBridge:
 
         self._nav_pose_twin_uuid = twin_uuid
         self._nav_pose_source_type = self._nav_status_source_type
+        # Resolve through the per-robot ROS namespace so the pose subscription
+        # matches the namespaced hardware topic in a fleet deployment.
+        resolve = getattr(self.node, "resolve_ros_topic", None)
+        pose_topic = resolve(pose_topic) if callable(resolve) else pose_topic
         self._nav_pose_topic = pose_topic
         self._nav_pose_subscription = self.node.create_subscription(
             msg_cls, pose_topic, callback, 10

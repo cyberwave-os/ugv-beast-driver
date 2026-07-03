@@ -105,18 +105,61 @@ build_ugv_base_node() {
         return 0
     fi
     
-    # Check if already installed
-    if [ -d "${WORKSPACE_PATH}/install/ugv_base_node" ]; then
+    # Check if already installed. Validate the ament index marker, not just the
+    # directory: a partial/failed Docker build can leave an empty
+    # install/ugv_base_node (colcon env hooks only) that would otherwise be
+    # mistaken for a complete install and skipped forever.
+    if [ -f "${WORKSPACE_PATH}/install/ugv_base_node/share/ament_index/resource_index/packages/ugv_base_node" ]; then
         echo "✅ ugv_base_node already installed, skipping build"
         return 0
     fi
-    
+
+    # Stale/partial install — clean before rebuilding so colcon starts fresh.
+    rm -rf "${WORKSPACE_PATH}/build/ugv_base_node" "${WORKSPACE_PATH}/install/ugv_base_node"
+
     echo "● Building ugv_base_node package..."
     if colcon build --packages-select ugv_base_node --parallel-workers 2; then
         echo "✅ ugv_base_node built successfully"
     else
         echo "⚠️  Warning: ugv_base_node failed to build - odometry will not be available"
         echo "    The UGV will still launch but without wheel odometry."
+    fi
+}
+
+# Function to ensure ugv_description is fully installed.
+# master_beast.launch.py unconditionally reads
+# install/ugv_description/share/ugv_description/urdf/ugv_beast.urdf, so the
+# driver cannot launch without it. A flaky Docker build (the dudulrx0601 base
+# image hits "Package 'rcutils' exports the library 'rcutils' which couldn't be
+# found") can leave a partial install — colcon env hooks present but the ament
+# marker and URDF missing. Self-heal here so already-deployed broken images
+# recover on restart instead of crash-looping.
+build_ugv_description() {
+    echo ""
+    echo "============================================================"
+    echo "📦 ENSURING UGV DESCRIPTION (URDF)"
+    echo "============================================================"
+
+    cd "${WORKSPACE_PATH}"
+    source /opt/ros/humble/setup.bash
+
+    local MARKER="${WORKSPACE_PATH}/install/ugv_description/share/ament_index/resource_index/packages/ugv_description"
+    local URDF="${WORKSPACE_PATH}/install/ugv_description/share/ugv_description/urdf/ugv_beast.urdf"
+
+    if [ -f "$MARKER" ] && [ -f "$URDF" ]; then
+        echo "✅ ugv_description already installed, skipping build"
+        return 0
+    fi
+
+    echo "● ugv_description install incomplete — building..."
+    rm -rf "${WORKSPACE_PATH}/build/ugv_description" "${WORKSPACE_PATH}/install/ugv_description"
+    if colcon build --packages-select ugv_description --symlink-install --parallel-workers 1 \
+        && [ -f "$MARKER" ] && [ -f "$URDF" ]; then
+        echo "✅ ugv_description built successfully"
+    else
+        echo "❌ Error: Failed to build ugv_description (URDF)."
+        echo "    master_beast.launch.py cannot start without it."
+        exit 1
     fi
 }
 
@@ -356,7 +399,10 @@ main() {
     
     # Step 3: Build ugv_base_node if not already installed (may have failed during Docker build)
     build_ugv_base_node
-    
+
+    # Step 3.5: Ensure ugv_description (URDF) is installed — hard launch dependency
+    build_ugv_description
+
     # Step 4: Always build ugv_bringup to ensure it's properly installed
     echo ""
     echo "● Building ugv_bringup to ensure proper installation..."

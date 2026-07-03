@@ -63,6 +63,39 @@ Notes:
 - `CYBERWAVE_SDK_VERSION` is isolated in its own layer (`runtime_base`) so SDK-only bumps avoid redoing heavy apt/WebRTC dependency layers.
 - `ugv_driver_base` includes layers through the "Install Additional System Packages" and stable Python dependency install stages.
 
+### Build & publish the `:staging` image
+
+Build the full runtime image and tag it `:staging`. Run from the
+**`cyberwave-edge-nodes`** parent directory so the shared `cyberwave-edge-common`
+package is in the build context. On a Raspberry Pi (native `arm64`):
+
+```bash
+cd cyberwave-edge-nodes
+
+docker buildx build \
+  --platform linux/arm64 \
+  -f cyberwave-edge-ros-ugv/docker-conf/Dockerfile \
+  --build-arg CYBERWAVE_SDK_VERSION=0.5.0 \
+  -t cyberwaveos/ugv-driver:staging \
+  --load \
+  .
+```
+
+Then publish it (requires push credentials for the target registry):
+
+```bash
+docker login -u cyberwaveos          # paste the Docker Hub access token when prompted
+docker push cyberwaveos/ugv-driver:staging
+```
+
+Notes:
+
+- `--load` places the image in the local Docker daemon so `docker push` can upload it; for a one-step build+push, replace `--load` with `--push`.
+- `:staging` is a **mutable** tag — every staging edge re-pulls it on the next driver (re)start, so publishing updates the whole staging fleet. After publishing, restart the driver on the device: `sudo systemctl restart cyberwave-edge-core`.
+- The build is several GB; ensure adequate free disk before building on an SD-card device. Most of that is the upstream `dudulrx0601/ugv_rpi_ros_humble` base image (~3 GB compressed / ~7 GB on disk) — which we cannot shrink from our Dockerfile — so our own layers add only ~40 MB on top.
+- **Image footprint:** only the packages the driver actually launches are built — `ugv_bringup`, `ugv_description`, `ugv_vision`, `ugv_interface`, `ugv_base_node`, `ldlidar`, and `mqtt_bridge`. The unused upstream nav/SLAM/gazebo/vizanti/apriltag stack is neither built nor shipped.
+- **Slimming is done *in-layer*, on purpose.** Deleting files in a later layer reclaims nothing — the bytes still ship in the lower layer (this is why an image whose workspace *looks* like 23 MB can still be 7.4 GB). So each artifact is removed in the same `RUN` that creates it: STAGE 7 clones with `--depth 1` and removes `.git` (~150 MB) + unused-package source right there; each colcon stage drops its own `build/`/`log/` scratch after building (`--symlink-install` packages are first materialized into real files via `/usr/local/bin/materialize_symlinks.sh`, since their `install/` symlinks point into `build/`). STAGE 14 is only a fail-hard integrity guard (aborts if any dangling `install/` symlink remains). To re-enable a package, add it to STAGE 10b's `--packages-select` and drop it from the STAGE 7 prune lists.
+
 ### 1. Set Up Environment
 
 Create a `.env` file in the workspace root:
@@ -76,18 +109,63 @@ CYBERWAVE_MQTT_PORT=1883
 # Rate limiting (1 Hz = 1 second between publishes)
 MQTT_PUBLISH_RATE_LIMIT=1.0
 
-# UGV velocity safety defaults
-CYBERWAVE_UGV_MAX_LINEAR_SPEED=0.35
+# UGV velocity limits (these are CAPS, not the robot's mechanical max ~1.2 m/s)
+# MAX_*  : hard ceiling — every teleop command is clamped to this.
+# DEFAULT_*: cruise speed used by the discrete keyboard commands (move_forward, ...).
+# Raise MAX_LINEAR toward ~1.2 for a faster rover; lower it for tight spaces.
+CYBERWAVE_UGV_MAX_LINEAR_SPEED=0.8
 CYBERWAVE_UGV_MAX_ANGULAR_SPEED=1.0
-CYBERWAVE_UGV_DEFAULT_LINEAR_SPEED=0.3
+CYBERWAVE_UGV_DEFAULT_LINEAR_SPEED=0.5
 CYBERWAVE_UGV_DEFAULT_ANGULAR_SPEED=1.0
 ```
+
+> **Speed:** these env vars are the only software speed cap in the path
+> (`MQTT → /cmd_vel → STM32 T:13`). The compiled default is now
+> `MAX_LINEAR=0.8 m/s` (≈2/3 of the rover's ~1.2 m/s mechanical max); set the env
+> var per deployment to go faster/slower. Higher speed means less reaction time —
+> the movement watchdog auto-stops after 0.5 s of command silence.
 
 The bridge consumes `locomotion.velocity_command.v1` for UGV movement. Legacy
 commands such as `move_forward` and `turn_left` are thin compatibility wrappers
 that emit the canonical velocity command before mapping to `/cmd_vel`. The edge
 keeps a timed stop as a local safety watchdog; backend timed execution remains
 the primary command-duration owner.
+
+#### Twin command payloads on `cyberwave/twin/{uuid}/command`
+
+Two shapes route through the `actuation` handler:
+
+1. **Discrete command** (keyboard teleop). `command` is the binding's actuation;
+   per-command params (camera/lights/video) live under `data`:
+
+   ```json
+   { "source_type": "tele", "command": "move_forward", "data": {}, "timestamp": 1750000000.1 }
+   ```
+
+   Movement actuations drive at the `DEFAULT_*` cruise speed; the 0.5 s movement
+   watchdog auto-stops on command silence.
+
+2. **Explicit analog velocity** (top-level `velocity_command`). When a message
+   carries a `velocity_command` object it is *authoritative* — the explicit
+   kinematics are honored regardless of the `command` string, and the
+   `duration_ms` deadman (timed stop) is armed instead of the keyboard watchdog:
+
+   ```json
+   {
+     "source_type": "tele",
+     "command": "move_forward",
+     "timestamp": 1750000000.1,
+     "velocity_command": { "linear_x": 0.6, "linear_y": 0.0, "angular_z": 0.4, "duration_ms": 300 }
+   }
+   ```
+
+   The `velocity_command` may be the full `locomotion.velocity_command.v1`
+   envelope or this *loose* form (just `linear_x`/`linear_y`/`angular_z`/
+   `duration_ms`); the missing `contract`/`gait`/`origin` default to the
+   locomotion contract / `walk` / `teleop`. `linear_y` is ignored on the tracked
+   UGV Beast, and `linear_x`/`angular_z` are still clamped to the `MAX_*` ceiling.
+   Senders may also set `command` to `velocity_command` or `locomotion_velocity`
+   with the same object — all routes converge on the locomotion handler.
 
 
 ```bash
@@ -159,6 +237,53 @@ Starting MQTT Bridge with Cyberwave SDK...
   Rate Limit (ROS->MQTT): 1.0s between publishes (1.00 Hz)
 
 [mqtt_bridge_node]: ROS->MQTT rate limiting enabled: 1.00s between publishes (1.00 Hz)
+```
+
+## ROS 2 Namespacing (multi-robot / fleet)
+
+So that several UGV Beasts can share one ROS 2 graph without their nodes and
+topics colliding, the whole driver runs under a **per-robot ROS 2 namespace
+derived from the twin UUID**:
+
+```
+ugv_beast_<first 6 hex chars of the twin uuid>      e.g.  ugv_beast_27dca7
+```
+
+A robot whose twin UUID is `27dca72f-6e17-…` therefore exposes:
+
+```
+/ugv_beast_27dca7/cmd_vel
+/ugv_beast_27dca7/ugv/led_ctrl
+/ugv_beast_27dca7/ugv/oled_ctrl
+/ugv_beast_27dca7/image_raw
+/ugv_beast_27dca7/ugv/joint_states
+```
+
+Why the `ugv_beast_` prefix: a raw UUID is **not** a valid ROS 2 name — names may
+contain only `[A-Za-z0-9_]` and may not start with a digit, while a UUID contains
+`-` and often starts with a digit. The prefix guarantees a valid leading letter;
+the 6-char hex suffix keeps it unique across a fleet.
+
+How it is applied (both sides must match, or topics won't connect):
+
+- **Hardware nodes** (`ugv_integrated_driver`, `base_node`, `robot_state_publisher`,
+  `usb_cam`, …) are launched under the namespace by `master_beast.launch.py`,
+  which reads `CYBERWAVE_TWIN_UUID` and computes `ugv_beast_<first6>`.
+- **The MQTT bridge** prefixes every ROS topic it publishes/subscribes via the
+  same namespace (`mqtt_bridge.ros_topic_namespace`), passed in by the launch as
+  the `ros_namespace` parameter.
+
+The two derivations are kept identical on purpose. MQTT topics are unaffected —
+they remain keyed by the full twin UUID (`cyberwave/twin/{twin_uuid}/…`).
+
+**Single-robot / dev:** when `CYBERWAVE_TWIN_UUID` is unset the namespace is empty
+and topics are global (`/cmd_vel`, `/ugv/oled_ctrl`, …) exactly as before.
+
+**Override:** set `CYBERWAVE_ROS_NAMESPACE` to a valid ROS 2 name to force a
+specific namespace (used for both the hardware nodes and the bridge):
+
+```bash
+export CYBERWAVE_ROS_NAMESPACE=ugv_beast_lab1
 ```
 
 ## Source Type Filtering
@@ -310,8 +435,11 @@ export MQTT_PUBLISH_RATE_LIMIT=0
     broker:
       host: mqtt.cyberwave.com
       port: 1883
+      # Auth: username is the public default "mqttcyb"; the password is your
+      # Cyberwave API key. Do NOT hardcode it — set CYBERWAVE_API_KEY in the env
+      # (edge-core injects it) and leave these blank so the SDK/token path wins.
       username: "mqttcyb"
-      password: "mqttcyb231"
+      password: ""
       use_cyberwave: true
     
     # Robot Mapping (MANDATORY)
