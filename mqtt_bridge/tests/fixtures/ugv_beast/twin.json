@@ -1,0 +1,228 @@
+{
+  "uuid": "67bb907f-b339-495c-9d20-487c905c8a98",
+  "name": "UGV Beast",
+  "description": "Digital twin created from asset",
+  "slug": "cyberwave/twins/ugv-beast",
+  "asset_uuid": "e574ffb8-6334-4866-91c8-ca3fc7c6a013",
+  "environment_uuid": "1167750b-35d6-4bf3-9a91-3bcd1f969f1a",
+  "controller_policy_uuid": "c930e0b1-db27-41e4-aba5-73230859f123",
+  "visibility": "org",
+  "created_at": "2026-07-25T18:15:34.433000+00:00",
+  "updated_at": "2026-07-25T18:32:47.483000+00:00",
+  "urdf_file": "https://static-dev.cyberwave.com/media/urdf_projects/waveshare-ugv-beast-70/urdf/NEWDATAUGV_BeastUGV_.urdf",
+  "position_x": 0.0,
+  "position_y": 0.0,
+  "position_z": 0.0,
+  "rotation_w": 1.0,
+  "rotation_x": 0.0,
+  "rotation_y": 0.0,
+  "rotation_z": 0.0,
+  "scale_x": 1.0,
+  "scale_y": 1.0,
+  "scale_z": 1.0,
+  "kinematics_override": {},
+  "joint_calibration": {},
+  "child_twin_uuids": [],
+  "attach_to_twin_uuid": null,
+  "attach_to_link": null,
+  "fixed_base": false,
+  "supported_simulation_backends": ["playground", "mujoco"],
+  "controllable_joint_names": [
+    "left_down_wheel_link_joint",
+    "left_up_wheel_link_joint",
+    "pt_base_link_to_pt_link1",
+    "pt_link1_to_pt_link2",
+    "right_down_wheel_link_joint",
+    "right_up_wheel_link_joint"
+  ],
+  "asset": {
+    "uuid": "e574ffb8-6334-4866-91c8-ca3fc7c6a013",
+    "name": "UGV Beast",
+    "description": "UGV Beast is a versatile, compact unmanned ground vehicle.",
+    "visibility": "public",
+    "owner_uuid": "fa5cc34b-ae6f-4619-b4a6-7f06a5570b3a",
+    "registry_id": "waveshare/ugv-beast",
+    "slug": "waveshare/catalog/ugv-beast-82",
+    "urdf_file": "https://static-dev.cyberwave.com/media/urdf_projects/waveshare-ugv-beast-70/urdf/NEWDATAUGV_BeastUGV_.urdf",
+    "workspace_uuid": "cdaebbc9-b278-42f7-a2d4-992465a2893c",
+    "has_universal_schema": true,
+    "metadata": {
+      "registry_id": "waveshare/ugv-beast",
+      "driver_family": "ros_python",
+      "drivers": {
+        "old": {
+          "params": ["--device /dev/ttyAMA0:/dev/ttyAMA0", "--device /dev/video0:/dev/video0"],
+          "docker_image": "cyberwaveos/edge-ros-ugv"
+        },
+        "default": {
+          "params": ["--device", "/dev/ttyAMA0:/dev/ttyAMA0", "--device", "/dev/video0:/dev/video0"],
+          "docker_image": "cyberwaveos/ugv-driver"
+        }
+      },
+      "production_uuid": "6be88314-bd1b-4fba-809a-448c4aedbf4a",
+      "_production_capabilities": {
+        "can_fly": false,
+        "has_wheels": true,
+        "can_actuate": true,
+        "can_locomote": true,
+        "locomotion_mode": "wheeled",
+        "sensors": [
+          {
+            "id": "front_camera",
+            "name": "front_camera",
+            "type": "rgb",
+            "model": null,
+            "offset": {
+              "position": {"x": -0.0583, "y": 0.0, "z": -0.01},
+              "rotation": {"w": 0.5, "x": 0.5, "y": -0.5, "z": -0.5}
+            },
+            "parameters": {"fovy": 153.5398, "width": 640, "height": 480, "update_rate": 15.0},
+            "fov_degrees": 153.5398,
+            "parent_link": "camera_link"
+          }
+        ]
+      }
+    },
+    "capabilities": {
+      "has_wheels": true,
+      "can_actuate": true,
+      "can_locomote": true,
+      "locomotion_mode": "wheeled",
+      "sensors": [
+        {
+          "id": "front_camera",
+          "name": "front_camera",
+          "type": "rgb",
+          "model": null,
+          "fov_degrees": 153.5398,
+          "parent_link": "camera_link",
+          "offset": {
+            "position": {"x": -0.0583, "y": 0.0, "z": -0.01},
+            "rotation": {"w": 0.5, "x": 0.5, "y": -0.5, "z": -0.5}
+          },
+          "parameters": {"width": 640, "height": 480, "update_rate": 15.0, "fovy": 153.5398}
+        }
+      ]
+    },
+    "universal_schema": {
+      "links": [
+        {"name": "base_footprint"},
+        {"name": "base_link"},
+        {"name": "pt_link1"},
+        {"name": "pt_link2"},
+        {"name": "lidar_link"},
+        {"name": "camera_link"},
+        {"name": "left_front_wheel"},
+        {"name": "left_rear_wheel"},
+        {"name": "right_front_wheel"},
+        {"name": "right_rear_wheel"}
+      ],
+      "joints": [
+        {"name": "camera_joint", "type": "fixed", "child_link": "camera_link", "parent_link": "pt_link2"}
+      ],
+      "sensors": [
+        {
+          "name": "front_camera",
+          "type": "camera",
+          "parent_link": "camera_link",
+          "update_rate": 15.0,
+          "pose": {
+            "position": {"x": -0.0583, "y": 0.0, "z": -0.01},
+            "orientation": {"w": 0.5, "x": 0.5, "y": -0.5, "z": -0.5}
+          },
+          "parameters": {
+            "fovy": 153.5398,
+            "width": 640,
+            "height": 480,
+            "description": "160° ultra-wide-angle 5MP USB camera on 2-DOF pan/tilt"
+          }
+        }
+      ]
+    }
+  },
+  "metadata": {
+    "edge_fingerprint": "raspberrypi-a4438ddfd350",
+    "registry_id": "waveshare/ugv-beast",
+    "driver_family": "ros_python",
+    "drivers": {
+      "default": {
+        "params": ["--device", "/dev/ttyAMA0:/dev/ttyAMA0", "--device", "/dev/video0:/dev/video0"],
+        "docker_image": "cyberwaveos/ugv-driver"
+      }
+    },
+    "production_uuid": "6be88314-bd1b-4fba-809a-448c4aedbf4a",
+    "_production_capabilities": {
+      "can_fly": false,
+      "has_wheels": true,
+      "can_actuate": true,
+      "can_locomote": true,
+      "locomotion_mode": "wheeled",
+      "sensors": [
+        {
+          "id": "front_camera",
+          "name": "front_camera",
+          "type": "rgb",
+          "model": null,
+          "offset": {
+            "position": {"x": -0.0583, "y": 0.0, "z": -0.01},
+            "rotation": {"w": 0.5, "x": 0.5, "y": -0.5, "z": -0.5}
+          },
+          "parameters": {"fovy": 153.5398, "width": 640, "height": 480, "update_rate": 15.0},
+          "fov_degrees": 153.5398,
+          "parent_link": "camera_link"
+        }
+      ]
+    }
+  },
+  "capabilities": {
+    "has_wheels": true,
+    "can_actuate": true,
+    "can_locomote": true,
+    "locomotion_mode": "wheeled",
+    "sensors": [
+      {
+        "id": "front_camera",
+        "name": "front_camera",
+        "type": "rgb",
+        "model": null,
+        "offset": {
+          "position": {"x": -0.0583, "y": 0.0, "z": -0.01},
+          "rotation": {"w": 0.5, "x": 0.5, "y": -0.5, "z": -0.5}
+        },
+        "parameters": {"fovy": 153.5398, "width": 640, "height": 480, "update_rate": 15.0},
+        "fov_degrees": 153.5398,
+        "parent_link": "camera_link"
+      }
+    ]
+  },
+  "universal_schema": {
+    "links": [
+      {"name": "base_footprint"},
+      {"name": "base_link"},
+      {"name": "pt_link1"},
+      {"name": "pt_link2"},
+      {"name": "lidar_link"},
+      {"name": "camera_link"},
+      {"name": "left_front_wheel"},
+      {"name": "left_rear_wheel"},
+      {"name": "right_front_wheel"},
+      {"name": "right_rear_wheel"}
+    ],
+    "joints": [
+      {"name": "camera_joint", "type": "fixed", "child_link": "camera_link", "parent_link": "pt_link2"}
+    ],
+    "sensors": [
+      {
+        "name": "front_camera",
+        "type": "camera",
+        "parent_link": "camera_link",
+        "update_rate": 15.0,
+        "pose": {
+          "position": {"x": -0.0583, "y": 0.0, "z": -0.01},
+          "orientation": {"w": 0.5, "x": 0.5, "y": -0.5, "z": -0.5}
+        },
+        "parameters": {"fovy": 153.5398, "width": 640, "height": 480}
+      }
+    ]
+  }
+}

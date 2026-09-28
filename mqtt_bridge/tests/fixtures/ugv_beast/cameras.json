@@ -1,0 +1,18 @@
+{
+  "devices": [
+    {
+      "card": "USB Camera: USB Camera",
+      "bus_info": "usb-xhci-hcd.1-2",
+      "paths": ["/dev/video0", "/dev/video1"],
+      "primary_path": "/dev/video0",
+      "index": 0,
+      "driver": "uvcvideo",
+      "serial": "20241221103",
+      "likelihood_score": 125
+    }
+  ],
+  "selected_device": 0,
+  "twin_to_device": {
+    "67bb907f-b339-495c-9d20-487c905c8a98": 0
+  }
+}

@@ -1,0 +1,183 @@
+version: 1
+robot_id: "robot_ugv_beast_v1"
+format: "json_by_name"
+metadata:
+  author: "Cyberwave"
+  created: "2025-12-17"
+  notes: "Mapping for UGV Beast - Wheels, Pan-Tilt, and Fixed joints"
+
+joints:
+  # Wheel joints (continuous rotation)
+  - ros_name: "left_up_wheel_link_joint"
+    mqtt_name: "left_up_wheel_link_joint"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+  - ros_name: "left_down_wheel_link_joint"
+    mqtt_name: "left_down_wheel_link_joint"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+  - ros_name: "right_up_wheel_link_joint"
+    mqtt_name: "right_up_wheel_link_joint"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+  - ros_name: "right_down_wheel_link_joint"
+    mqtt_name: "right_down_wheel_link_joint"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+  # Pan-tilt mechanism joints (Actuated via Servos)
+  - ros_name: "pt_base_link_to_pt_link1"
+    mqtt_name: "pt_base_link_to_pt_link1"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+  - ros_name: "pt_link1_to_pt_link2"
+    mqtt_name: "pt_link1_to_pt_link2"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+  # Fixed joints (Structural)
+  - ros_name: "base_footprint_joint"
+    mqtt_name: "base_footprint_joint"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+  - ros_name: "lidar_joint"
+    mqtt_name: "lidar_joint"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+  - ros_name: "camera_joint"
+    mqtt_name: "camera_joint"
+    transform:
+      scale: 1.0
+      offset: 0.0
+      invert: false
+
+capabilities:
+  supports_atomic_pose: true
+  # Determines which upstream telemetry topics to publish (joint, pose, or both)
+  upstream_mode: "both"
+  upstream_topics:
+    - pose # {prefix}cyberwave/pose/{twin_uuid}/update
+    - joint # {prefix}cyberwave/joint/{twin_uuid}/update
+
+# Command Registry class for this robot
+command_registry: "mqtt_bridge.plugins.ugv_beast_command_handler.CommandRegistry"
+
+# Camera HARDWARE CAPTURE only (ROS/usb_cam). Sensor identity (WebRTC `sensor` id
+# and TF `frame_id`) comes from the TWIN JSON — do NOT reintroduce camera_name/frame_id here.
+# USB-2 note: YUYV can't sustain high res on the Pi bus; MJPG is the only way to stream
+# high res/fps. Default MJPG 1280x720@30; the bridge adapts fps-first, then dimension.
+camera:
+  # ROS2 image topic to stream via WebRTC
+  image_topic: "/image_raw"
+  # WebRTC wire format produced by the bridge track (kept for compatibility).
+  format: "yuv420p"
+  # The bridge owns the usb_cam process (kill/wait-device-free/relaunch). Set
+  # false to fall back to launching usb_cam from master_beast.launch.py instead.
+  managed_by_bridge: true
+  # Last-resort fallback only; device selection normally comes from the JSON.
+  video_device: "auto"
+  io_method: "mmap"
+  camera_info_url: "package://ugv_vision/config/camera_info.yaml"
+
+  # --- Default capture format ---
+  # Benchmarked best for this hardware (Pi 5, software H.264 — no HW encoder):
+  # MJPG 1280x720@30 sustains comfortably with headroom for the ROS stack, while
+  # 1080p only does ~33 fps software. 1080p remains selectable at runtime via
+  # set_camera_format (it's in supported_formats) and is the adaptation ceiling.
+  # See scripts/ugv_beast/benchmark_camera.py.
+  pixel_format: "mjpeg2rgb" # MJPG decoded to rgb8; survives USB2 at high res
+  image_width: 1280
+  image_height: 720
+  capture_fps: 30 # what usb_cam captures
+  stream_fps: 30 # default WebRTC send rate (adaptation trims to fps_floor under load)
+
+  # Auto-features - set to true if camera supports them, false otherwise
+  auto_white_balance: true
+  autoexposure: true
+  autofocus: false # Most USB webcams don't have motorized autofocus
+
+  # --- Capability table: the driver validates runtime selections against this ---
+  # YUYV is uncompressed, so it is only sane at <=640x480 on USB2.
+  supported_formats:
+    mjpeg2rgb:
+      sizes: [[1920, 1080], [1280, 960], [1280, 720], [1024, 768], [800, 600], [640, 480], [352, 288], [320, 240], [160, 120]]
+      max_fps: 30
+    yuyv:
+      sizes: [[640, 480]]
+      max_fps: 30
+
+  # --- Dynamic adaptation (bridge-side; applied WITHOUT touching the camera) ---
+  # Rule: drop fps to fps_floor FIRST, then only shrink dimension. Never < fps_floor.
+  adaptation:
+    enabled: true
+    cpu_high: 85 # CPU% (EMA) -> step DOWN a rung
+    cpu_low: 55 # CPU% (EMA), held -> step UP a rung
+    fps_floor: 15 # hard floor: never send below this fps
+    check_period_s: 2.0
+    cooldown_s: 10.0 # min dwell before stepping back up (anti-flap)
+    # The ladder is clamped at runtime to the active capture format (clamp_ladder),
+    # so with the 1280x720@30 default it becomes 720p30 -> 720p15 -> 800x600 -> 640x480.
+    # Rungs above the capture size are harmlessly clamped down; if you raise the
+    # capture (e.g. set_camera_format to 1080p) the higher rungs become active.
+    target: [1280, 720, 30]
+    ladder: # [width, height, fps] best -> worst
+      - [1920, 1080, 30]
+      - [1920, 1080, 15] # fps reduced to floor; dimension unchanged
+      - [1280, 720, 15] # from here only dimension shrinks; fps stays at floor
+      - [800, 600, 15]
+      - [640, 480, 15]
+
+# Internal Odometry calculation settings (for robots without /odom topic)
+internal_odometry:
+  enabled: true
+  track_width: 0.23 # meters
+  wheel_radius: 0.04 # meters
+  left_wheel_joints: ["left_up_wheel_link_joint", "left_down_wheel_link_joint"]
+  right_wheel_joints:
+    ["right_up_wheel_link_joint", "right_down_wheel_link_joint"]
+
+# Robot motion constants for safe trajectory generation
+robot_constants:
+  # Maximum joint velocities (rad/s)
+  max_velocities:
+    # Wheel joints (continuous rotation, higher speed)
+    left_up_wheel_link_joint: 10.0
+    left_down_wheel_link_joint: 10.0
+    right_up_wheel_link_joint: 10.0
+    right_down_wheel_link_joint: 10.0
+    # Pan-tilt joints (limited range, slower speed)
+    pt_base_link_to_pt_link1: 1.5 # Pan joint
+    pt_link1_to_pt_link2: 1.5 # Tilt joint
+    default: 2.0
+
+  # Maximum joint accelerations (rad/s²)
+  max_accelerations:
+    # Wheel joints (higher acceleration for responsive movement)
+    left_up_wheel_link_joint: 15.0
+    left_down_wheel_link_joint: 15.0
+    right_up_wheel_link_joint: 15.0
+    right_down_wheel_link_joint: 15.0
+    # Pan-tilt joints (lower acceleration for stability)
+    pt_base_link_to_pt_link1: 3.0
+    pt_link1_to_pt_link2: 3.0
+    default: 5.0
+
+  # Minimum trajectory time (seconds) - for responsive UGV control
+  min_trajectory_time: 0.2
+
+  # Safety factor to multiply calculated time
+  time_safety_factor: 1.3

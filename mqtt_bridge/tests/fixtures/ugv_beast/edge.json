@@ -1,0 +1,37 @@
+{
+  "uuid": "ecc7e2a9-1cb9-4a10-bea7-05d6cca547ca",
+  "fingerprint": "raspberrypi-a4438ddfd350",
+  "name": "",
+  "workspace_uuid": "9bbdca47-88c1-4734-b7b1-b75caefa935f",
+  "hostname": "",
+  "platform": "",
+  "status": "offline",
+  "is_online": false,
+  "liveness_state": "offline",
+  "created_at": "2026-07-25T18:32:50.748000Z",
+  "updated_at": "2026-07-25T18:32:51.037000Z",
+  "organization_uuid": "a9fb6b5b-118c-4e3a-9b36-c6246130512d",
+  "metadata": {
+    "cameras": {
+      "devices": [
+        {
+          "card": "USB Camera: USB Camera",
+          "index": 0,
+          "paths": ["/dev/video0", "/dev/video1"],
+          "driver": "uvcvideo",
+          "serial": "20241221103",
+          "bus_info": "usb-xhci-hcd.1-2",
+          "primary_path": "/dev/video0",
+          "likelihood_score": 125
+        }
+      ],
+      "twin_to_device": {
+        "67bb907f-b339-495c-9d20-487c905c8a98": 0
+      },
+      "selected_device": 0
+    }
+  },
+  "last_heartbeat": null,
+  "last_seen_at": null,
+  "last_ip_address": null
+}

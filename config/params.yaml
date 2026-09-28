@@ -1,0 +1,145 @@
+/mqtt_bridge_node:
+  ros__parameters:
+    broker:
+      # Empty so CYBERWAVE_MQTT_HOST from edge-core wins.
+      host: ""
+      # Default; CYBERWAVE_MQTT_PORT from edge-core always overrides.
+      port: 8883
+      # username: ""
+      # password: ""
+      # false = Cyberwave SDK token auth (recommended); true = direct paho user/pass (legacy).
+      use_paho_direct: false
+      use_cyberwave: true
+    # Set via CYBERWAVE_API_KEY/CYBERWAVE_TOKEN from edge-core; never bake tokens in the image.
+    cyberwave_token: ""
+    topic_prefix: ""
+    prevent_duplicate_offers: true
+    # Robot camera settings (image_topic, resolution, fps) live in the robot mapping file.
+    webrtc:
+      # true = SDK run_with_auto_reconnect (reconnect + start/stop_video commands + health monitor).
+      auto_start: true
+      auto_start_delay_sec: 10.0
+      auto_start_retry_sec: 5.0
+      # Lower if Pi USB/network is congested; not auto-adapted.
+      fps: 15.0
+      # false = normal ICE; true = relay-only (breaks if TURN unreachable).
+      force_turn: false
+
+    # Operator override of the mapping's camera block (Pi 5 software encode; "" defers to mapping).
+    camera:
+      pixel_format: "mjpeg2rgb"
+      image_width: 1280
+      image_height: 720
+      fps: 30
+
+    # Kill-switch: if true, no upstream MQTT (telemetry/status/health) to cloud.
+    disable_all_upstream: false
+
+    # Command sub QoS: 0/1/2; 1 = reliable low-latency (recommended).
+    mqtt_command_qos: 1
+
+    mapping_reload_on_change: true
+    # Upstream ROS->MQTT publish rate (Hz); 0 disables. Also settable via MQTT_PUBLISH_RATE_LIMIT.
+    ros2mqtt_rate_limit: 5.0
+
+    disable_edge_joint_updates: false
+
+    # Robot mapping file loaded from config/mappings/{robot_id}.yaml (e.g. robot_ugv_beast_v1, default).
+    robot_id: "default"
+
+    navigation:
+      frame_id: map
+      source_type: edge
+      navigate_to_pose_action: navigate_to_pose
+      follow_path_action: follow_path
+      # Pose feedback source (/odom or /amcl_pose).
+      # pose_topic: /odom
+      pose_topic_type: odom
+
+    bridge:
+      mqtt2ros:
+        mqtt_topics:
+          - cyberwave/joint/{twin_uuid}/update
+          - cyberwave/twin/{twin_uuid}/command
+          - cyberwave/twin/{twin_uuid}/navigate/command
+          - cyberwave/twin/{twin_uuid}/motion/command
+        topics:
+          # {twin_uuid} is substituted from the mapping file.
+          cyberwave/joint/{twin_uuid}/update:
+            # ScaledJointTrajectoryController (UR robot arms)
+            - ros_topic: /scaled_joint_trajectory_controller/joint_trajectory
+              sdk_method: subscribe_twin_joint_states
+              type: trajectory_msgs/JointTrajectory
+            # UGV Beast joint states (wheel + pan-tilt)
+            - ros_topic: /ugv/joint_states
+              sdk_method: subscribe_twin_joint_states
+              type: sensor_msgs/JointState
+            # Mujoco simulation
+            - ros_topic: /mujoco/joint_commands
+              sdk_method: subscribe_twin_joint_states
+              type: std_msgs/Float64MultiArray
+          # Command router: handled specially by CommandRegistry (no direct ROS mapping).
+          # Supported commands: actuation, lights, camera_servo, oled_ctrl, gripper, estop, etc.
+
+      ros2mqtt:
+        ros_topics:
+          - /ping/ros
+          - /ugv/joint_states
+          - /joint_states
+          # - /ugv/imu  # Disabled by default to reduce MQTT bandwidth
+          - /ugv/battery_status
+          - /voltage
+          - /odom
+          # - /odom/odom_raw  # Disabled by default to reduce MQTT bandwidth
+          - /cmd_vel
+          - /ugv/oled_ctrl
+          - /scaled_joint_trajectory_controller/joint_trajectory
+          - /mujoco/joint_states
+        # ROS topic -> MQTT topic. Pattern: cyberwave/{resource_type}/{twin_uuid}/{action}
+        topics:
+          /ping/ros:
+            mqtt_topic: /ping
+          /ugv/joint_states:
+            mqtt_topic: "cyberwave/joint/{twin_uuid}/update"
+            sdk_method: update_joint_state
+            type: sensor_msgs/JointState
+            rate: 5.0
+          /joint_states:
+            mqtt_topic: "cyberwave/joint/{twin_uuid}/update"
+            sdk_method: update_joint_state
+            type: sensor_msgs/JointState
+            rate: 5.0
+          # /ugv/imu:  # Disabled by default to reduce MQTT bandwidth
+          #   mqtt_topic: "cyberwave/twin/{twin_uuid}/imu"
+          #   type: sensor_msgs/Imu
+          /ugv/battery_status:
+            mqtt_topic: "cyberwave/twin/{twin_uuid}/battery/status"
+            type: sensor_msgs/BatteryState
+            interval: 60.0
+          /voltage:
+            mqtt_topic: "cyberwave/twin/{twin_uuid}/battery/status"
+            type: std_msgs/Float32
+            interval: 60.0
+          /odom:
+            # update_twin_pose splits this into position + rotation topics.
+            mqtt_topic: "cyberwave/twin/{twin_uuid}/pose" # Base topic (not directly used)
+            sdk_method: update_twin_pose
+            type: nav_msgs/Odometry
+            rate: 5.0
+          # /odom/odom_raw:  # Disabled by default to reduce MQTT bandwidth
+          #   mqtt_topic: "cyberwave/twin/{twin_uuid}/odom_raw"
+          #   type: std_msgs/Float32MultiArray
+          #   rate: 10.0 # Raw wheel odometry at 10Hz
+          /cmd_vel:
+            mqtt_topic: "cyberwave/twin/{twin_uuid}/cmd_vel"
+            type: geometry_msgs/Twist
+          /ugv/oled_ctrl:
+            mqtt_topic: "cyberwave/twin/{twin_uuid}/oled"
+            type: std_msgs/String
+          /scaled_joint_trajectory_controller/joint_trajectory:
+            mqtt_topic: "cyberwave/twin/{twin_uuid}/trajectory"
+            type: trajectory_msgs/JointTrajectory
+          /mujoco/joint_states:
+            mqtt_topic: "cyberwave/joint/{twin_uuid}/update"
+            sdk_method: update_joint_state
+            type: sensor_msgs/JointState

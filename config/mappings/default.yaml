@@ -1,0 +1,21 @@
+version: 1
+robot_id: "default"
+format: "json_by_name"
+metadata:
+  author: "Cyberwave"
+  created: "2025-11-19"
+  notes: "Generic default mapping."
+  # UUID of the digital twin resource on the Cyberwave backend.
+  twin_uuid: "00000000-0000-0000-0000-000000000000"
+
+joints: []
+
+capabilities:
+  supports_atomic_pose: false
+  upstream_mode: "joint"
+  upstream_topics:
+    - joint
+
+# Default command registry for basic command handling (movement, lights, etc.)
+command_registry: "mqtt_bridge.plugins.ugv_beast_command_handler.CommandRegistry"
+
