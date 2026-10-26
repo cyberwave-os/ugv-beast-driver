@@ -1,0 +1,36 @@
+# Gitleaks config for the UGV Beast public-sync gate (edge-node-ugv-driver-test-and-push.yml).
+# Keep the allowlist SPECIFIC: only genuine non-secret placeholders, never real credential patterns.
+
+title = "UGV Beast public-sync gitleaks"
+
+[extend]
+# Start from gitleaks' built-in rule set (AWS/GCP/GitHub/Slack/private keys/...).
+useDefault = true
+
+[allowlist]
+description = "Known-safe placeholders and non-secret files"
+
+# Files that are templates/docs/tests by design — safe to exclude wholesale.
+paths = [
+  '''\.env\.example$''',          # public env template (placeholder values only)
+  '''\.gitleaks\.toml$''',        # this config
+  '''(^|/)tests?/''',             # unit tests + fixtures
+  '''.*_test\.py$''',
+  '''.*\.md$''',                  # docs / READMEs
+  '''config/mappings/.*\.yaml$''',# robot mapping examples (all-zero placeholder UUIDs)
+]
+
+# Specific placeholder strings that look secret-ish but are not.
+regexes = [
+  '''your_api_token_here''',                                   # .env.example
+  '''0{8}-0{4}-0{4}-0{4}-0{12}''',                             # all-zero placeholder UUID
+  '''(cw_your_api_key|your_.*_here|<[^>]+>|CHANGE_ME|xxxx+)''', # generic placeholders
+]
+
+# Placeholder credentials seen ONLY in commit stopwords, not real secrets.
+stopwords = [
+  "example",
+  "placeholder",
+  "changeme",
+  "dummy",
+]

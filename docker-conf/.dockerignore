@@ -1,0 +1,17 @@
+# Exclude these files/folders from docker build context
+docker-conf/
+docs/
+.env
+README.md
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.git/
+.vscode/
+*.egg-info/
+build/
+dist/
+install/
+log/
+.pytest_cache/
